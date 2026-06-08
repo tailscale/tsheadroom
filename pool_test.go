@@ -34,6 +34,7 @@ func TestHelperProcess(t *testing.T) {
 	emit(map[string]any{"ready": true})
 
 	r := bufio.NewReader(os.Stdin)
+	calls := 0
 	for {
 		line, err := r.ReadBytes('\n')
 		if err != nil {
@@ -44,11 +45,17 @@ func TestHelperProcess(t *testing.T) {
 			emit(responseEnvelope{OK: false, Error: "bad json", ErrorType: "ValueError"})
 			continue
 		}
+		calls++
 		switch req.Payload.Model {
 		case "CRASH":
 			os.Exit(1) // die without responding
 		case "HANG":
 			time.Sleep(30 * time.Second) // longer than any test deadline
+		case "SLOW_ONCE":
+			if calls == 1 {
+				// Slow first call (like a one-time model load), then fast.
+				time.Sleep(800 * time.Millisecond)
+			}
 		case "ERROR":
 			emit(responseEnvelope{ID: req.ID, OK: false, Error: "boom", ErrorType: "RuntimeError"})
 			continue
@@ -76,7 +83,12 @@ func helperCmd() func() *exec.Cmd {
 
 func testPool(t *testing.T, size int) *Pool {
 	t.Helper()
-	p := newPool(size, helperCmd(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return testPoolCap(t, size, 30*time.Second)
+}
+
+func testPoolCap(t *testing.T, size int, maxCompress time.Duration) *Pool {
+	t.Helper()
+	p := newPool(size, helperCmd(), maxCompress, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	t.Cleanup(p.Shutdown)
 	return p
 }
@@ -127,15 +139,41 @@ func TestPool_CrashRecovery(t *testing.T) {
 	}
 }
 
-func TestPool_DeadlineFailsOpen(t *testing.T) {
-	p := testPool(t, 1)
-	_, err := mustCompress(t, p, compressRequest{Model: "HANG"}, 200*time.Millisecond)
+// A slow first call (e.g. a one-time model load) must fail the client open at
+// its deadline WITHOUT killing the worker, so the worker finishes, stays warm,
+// and the next call succeeds — no recycle, no restart.
+func TestPool_SlowCallFailsOpenButWorkerWarms(t *testing.T) {
+	p := testPoolCap(t, 1, 10*time.Second) // generous hard cap
+
+	// Client deadline (200ms) is well under the worker's 800ms first call.
+	_, err := mustCompress(t, p, compressRequest{Model: "SLOW_ONCE"}, 200*time.Millisecond)
 	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
+		t.Fatalf("first call err = %v, want DeadlineExceeded (fail open)", err)
 	}
-	// The hung worker must be recycled so the pool keeps serving.
+
+	// The same worker should now be warm: a generous-deadline call succeeds.
+	res, err := mustCompress(t, p, compressRequest{Model: "SLOW_ONCE", Messages: []any{"x"}}, 5*time.Second)
+	if err != nil {
+		t.Fatalf("worker did not warm/recover after slow first call: %v", err)
+	}
+	if res.TokensSaved != 60 {
+		t.Errorf("warm call tokens_saved = %d, want 60", res.TokensSaved)
+	}
+}
+
+// A worker that blows the hard cap is genuinely wedged and must be recycled.
+func TestPool_HardCapRecyclesWedgedWorker(t *testing.T) {
+	p := testPoolCap(t, 1, 300*time.Millisecond) // tiny hard cap
+
+	// HANG sleeps far longer than the hard cap; the call should error and the
+	// worker should be recycled.
+	_, err := mustCompress(t, p, compressRequest{Model: "HANG"}, 5*time.Second)
+	if err == nil {
+		t.Fatal("expected error when worker exceeds the hard cap")
+	}
+	// Fresh worker serves the next call.
 	if _, err := mustCompress(t, p, compressRequest{Messages: []any{"x"}}, 5*time.Second); err != nil {
-		t.Fatalf("pool did not recover after deadline: %v", err)
+		t.Fatalf("pool did not recover after hard-cap recycle: %v", err)
 	}
 }
 
@@ -161,7 +199,7 @@ func TestPool_ConcurrentLoad(t *testing.T) {
 }
 
 func TestPool_ShutdownIsPrompt(t *testing.T) {
-	p := newPool(2, helperCmd(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	p := newPool(2, helperCmd(), 30*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if _, err := mustCompress(t, p, compressRequest{Messages: []any{"x"}}, 5*time.Second); err != nil {
 		t.Fatalf("warmup compress: %v", err)
 	}

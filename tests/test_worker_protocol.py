@@ -68,6 +68,22 @@ class ProtocolTest(unittest.TestCase):
         self.assertEqual(out[4]["id"], 4)
         self.assertTrue(out[4]["ok"])
 
+    def test_forwards_model_and_config(self):
+        cfg = {"compress_user_messages": True, "protect_recent": 0, "target_ratio": 0.3}
+        req = json.dumps({"id": 1, "payload": {
+            "messages": [{"role": "user", "content": "hi"}],
+            "model": "gpt-4o",
+            "config": cfg,
+        }})
+        out, proc = run_worker([req])
+        self.assertEqual(out[0], {"ready": True}, msg=proc.stderr)
+        # The fake headroom echoes the kwargs it received.
+        kw = out[1]["result"]["messages"][0]["received_kwargs"]
+        self.assertEqual(kw.get("model"), "gpt-4o")
+        self.assertTrue(kw.get("compress_user_messages"))
+        self.assertEqual(kw.get("protect_recent"), 0)
+        self.assertEqual(kw.get("target_ratio"), 0.3)
+
     def test_clean_exit_on_eof(self):
         out, proc = run_worker([json.dumps({"id": 1, "payload": {"messages": [{"role": "user", "content": "x"}]}})])
         self.assertEqual(proc.returncode, 0, msg=proc.stderr)

@@ -26,6 +26,7 @@ func (f fakeCompressor) Compress(ctx context.Context, req compressRequest) (*com
 func newTestHandler(fn func(ctx context.Context, req compressRequest) (*compressResult, error)) *Handler {
 	return &Handler{
 		comp:     fakeCompressor{fn: fn},
+		settings: loadSettings("", slog.New(slog.NewTextHandler(io.Discard, nil))),
 		deadline: time.Second,
 		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 		out:      io.Discard,
@@ -189,6 +190,27 @@ func TestHandler_VerboseSummary(t *testing.T) {
 	doHook(t, h2, `{"request_body":{"model":"gpt-4o","messages":[{"role":"user","content":"x"}]}}`)
 	if !strings.Contains(buf.String(), "-> allow") {
 		t.Errorf("verbose line %q missing %q", buf.String(), "-> allow")
+	}
+}
+
+func TestHandler_ForwardsSettings(t *testing.T) {
+	var gotConfig CompressSettings
+	h := newTestHandler(func(_ context.Context, req compressRequest) (*compressResult, error) {
+		gotConfig = req.Config
+		return &compressResult{Messages: []any{"x"}, TokensSaved: 1}, nil
+	})
+	// Tune the store; the handler should forward the snapshot per request.
+	tuned := defaultSettings()
+	tuned.CompressUserMessages = true
+	tuned.ProtectRecent = 1
+	if err := h.settings.set(tuned); err != nil {
+		t.Fatalf("set settings: %v", err)
+	}
+
+	doHook(t, h, `{"request_body":{"model":"gpt-4o","messages":[{"role":"user","content":"x"}]}}`)
+
+	if !gotConfig.CompressUserMessages || gotConfig.ProtectRecent != 1 {
+		t.Fatalf("settings not forwarded to compressor: %+v", gotConfig)
 	}
 }
 

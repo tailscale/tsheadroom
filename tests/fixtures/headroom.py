@@ -31,13 +31,13 @@ class CompressResult:
         self.transforms_applied = transforms_applied or []
 
 
-def compress(messages, model=DEFAULT_MODEL):
+def compress(messages, **kwargs):
+    # Echo whatever kwargs the worker forwarded (model + config knobs) so
+    # subprocess protocol tests can assert they arrived intact.
     if not messages:
         return CompressResult(messages=[])
-    # Pretend we halved the token count, and echo a marker so tests can confirm
-    # the worker returned the compressed messages (not the originals).
     return CompressResult(
-        messages=[{"compressed": True, "model": model}],
+        messages=[{"compressed": True, "received_kwargs": kwargs}],
         tokens_before=100,
         tokens_after=50,
         tokens_saved=50,

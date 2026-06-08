@@ -48,6 +48,17 @@ To run tsheadroom on a system you need:
    /opt/tsheadroom/venv/bin/pip install headroom-ai
    ```
    `headroom-ai` ships prebuilt wheels, so no Rust toolchain is needed.
+
+   The base install compresses **tool outputs** (SmartCrusher — pure Python).
+   **Text/prose compression (Kompress) is ML-based and needs extra deps** that
+   aren't in the base wheel; install the `[ml]` extra to enable it:
+   ```bash
+   /opt/tsheadroom/venv/bin/pip install 'headroom-ai[ml]'   # torch + transformers
+   ```
+   Without it, knobs that target text (e.g. `compress_user_messages`,
+   `target_ratio`) change routing but won't yield savings — only tool-output
+   compression is active. See "Tuning compression" and "What actually gets
+   compressed".
 3. **`worker.py`** from this repo (the `-worker` flag points at it).
 4. **A Tailscale auth key** (`TS_AUTHKEY`) so the node can join your tailnet
    unattended. Generate one in the Tailscale admin console → Settings → Keys.
@@ -74,9 +85,11 @@ path `/`. Other tailnet nodes (including Aperture) reach it at
 | `-worker` | `worker.py` | Path to the worker script. |
 | `-hostname` | `tsheadroom` | Node name on the tailnet. |
 | `-pool-size` | `max(4, GOMAXPROCS)` | Number of persistent Python workers. |
-| `-deadline` | `4s` | Per-request fail-open deadline. Keep it under Aperture's hook `timeout`. |
+| `-deadline` | `4s` | Per-request fail-open deadline (client-facing). Keep it under Aperture's hook `timeout`. |
+| `-max-compress` | `60s` | Hard cap on a single worker call before it's recycled. Must exceed `-deadline`; covers one-time ML model loads (see "Tuning compression"). |
 | `-addr` | `:80` | Listen address on the tsnet node. |
 | `-state-dir` | tsnet default | tsnet state directory. **Persist this** — it holds the node identity (`tailscaled.state`). See note below. |
+| `-config` | `tsheadroom.config.json` | Path to the tunable compress-config file (see "Tuning compression"). Loaded at startup, rewritten on `PUT /config`. |
 | `-local-addr` | (off) | Serve plain HTTP here instead of tsnet — for local testing only. |
 | `-v` | off | Log a one-line per-request summary (`in/out` sizes, `modify`/`allow`) to stdout. |
 
@@ -160,6 +173,69 @@ Notes:
   fail-open fires before Aperture times the call out.
 - Scope `models` to target specific providers, and use `preference` if you stack
   it with other guardrail hooks.
+
+## Tuning compression (runtime config)
+
+tsheadroom exposes Headroom's compression knobs as **live, persisted
+configuration** — no flag soup, no restart. The settings load from the
+`-config` file at startup (defaults if it's missing), and a small HTTP API on
+the same node lets you read and change them on the fly; every change is written
+back to the file, so the service comes back up with your last state.
+
+```bash
+# Read the current settings
+curl -s http://tsheadroom.<your-tailnet>.ts.net/config
+
+# Change one or more (partial updates merge onto current values)
+curl -s -X PUT http://tsheadroom.<your-tailnet>.ts.net/config \
+  -H 'Content-Type: application/json' \
+  -d '{"compress_user_messages": true, "target_ratio": 0.3}'
+```
+
+The change takes effect on the **next request** (settings ride along with each
+request to the workers). Invalid values are rejected with `400` and leave the
+current config untouched. You can also just edit the `-config` JSON file and
+restart.
+
+Tunable parameters (these mirror Headroom's `CompressConfig`):
+
+| field | type | default | effect |
+|---|---|---|---|
+| `compress_user_messages` | bool | `false` | Also compress user-message content (off = protect it). Turn on for prose/RAG-heavy inputs. |
+| `compress_system_messages` | bool | `true` | Compress system messages. |
+| `protect_recent` | int | `4` | Leave the last N messages untouched. `0` = compress everything. |
+| `protect_analysis_context` | bool | `true` | Detect "analyze/review" intent and protect code. |
+| `target_ratio` | float \| null | `null` | Keep-ratio for text compression. `null` = model decides (~aggressive); `0.5` = keep 50%. |
+| `min_tokens_to_compress` | int | `250` | Skip messages shorter than this. |
+| `kompress_model` | string \| null | `null` | Override the Kompress model id; `null` = default. |
+
+Access is gated by your tailnet ACLs (anyone who can reach the node can read and
+change config). Lock the node down accordingly, or restrict who can reach it.
+
+> **Note:** `compress_user_messages` and `target_ratio` act on the ML text
+> compressor (Kompress), which requires the `[ml]` extra (see Dependencies).
+> Without it these knobs change routing but produce no savings; tool-output
+> compression (`min_tokens_to_compress`, etc.) works in the base install.
+
+### ML model loading and timeouts
+
+The ML text compressor loads a ~600MB model on first use (one-time, then cached
+on disk and resident in each worker). This load takes several seconds — longer
+than the `-deadline` — so tsheadroom handles it with two separate timeouts:
+
+- **`-deadline` (4s)** bounds the *client* response: if a call is still running,
+  tsheadroom fails open (`allow`) so Aperture is never held up.
+- **`-max-compress` (60s)** bounds the *worker*: the call keeps running in the
+  background past the deadline, so the model finishes loading and the worker
+  stays warm. Only a call exceeding the hard cap is treated as wedged and
+  recycled.
+
+The result: enabling text compression at runtime via `PUT /config` costs **at
+most one** uncompressed (`allow`) request while the model loads, then it works —
+**no restart needed**. To avoid even that one, workers **preload** the model at
+startup whenever the persisted config has a text knob enabled (so new/restarted
+workers come up warm). The first cold start downloads the model, which can take
+a while; the worker only reports ready once it's loaded.
 
 ## What actually gets compressed
 

@@ -28,15 +28,17 @@ import (
 
 func main() {
 	var (
-		hostname  = flag.String("hostname", "tsheadroom", "tsnet hostname (how this node appears on the tailnet)")
-		poolSize  = flag.Int("pool-size", max(4, runtime.GOMAXPROCS(0)), "number of Python compression workers")
-		deadline  = flag.Duration("deadline", 4*time.Second, "per-request fail-open deadline (keep under aperture's hook timeout)")
-		python    = flag.String("python", "python3", "Python interpreter with headroom-ai installed")
-		script    = flag.String("worker", "worker.py", "path to worker.py")
-		addr      = flag.String("addr", ":80", "listen address on the tsnet node")
-		stateDir  = flag.String("state-dir", "", "tsnet state directory (default: tsnet's own default)")
-		localAddr = flag.String("local-addr", "", "if set, serve plain HTTP here instead of tsnet (for local testing)")
-		verbose   = flag.Bool("v", false, "log a per-request summary (in/out sizes, modify/allow) to stdout")
+		hostname    = flag.String("hostname", "tsheadroom", "tsnet hostname (how this node appears on the tailnet)")
+		poolSize    = flag.Int("pool-size", max(4, runtime.GOMAXPROCS(0)), "number of Python compression workers")
+		deadline    = flag.Duration("deadline", 4*time.Second, "per-request fail-open deadline (keep under aperture's hook timeout)")
+		maxCompress = flag.Duration("max-compress", 60*time.Second, "hard cap on a single worker call before it's recycled (must exceed -deadline; covers one-time model loads)")
+		python      = flag.String("python", "python3", "Python interpreter with headroom-ai installed")
+		script      = flag.String("worker", "worker.py", "path to worker.py")
+		addr        = flag.String("addr", ":80", "listen address on the tsnet node")
+		stateDir    = flag.String("state-dir", "", "tsnet state directory (default: tsnet's own default)")
+		configF     = flag.String("config", "tsheadroom.config.json", "path to the tunable compress-config file (created/updated via PUT /config)")
+		localAddr   = flag.String("local-addr", "", "if set, serve plain HTTP here instead of tsnet (for local testing)")
+		verbose     = flag.Bool("v", false, "log a per-request summary (in/out sizes, modify/allow) to stdout")
 	)
 	flag.Parse()
 
@@ -48,17 +50,35 @@ func main() {
 		os.Exit(1)
 	}
 
-	pool := NewPool(*poolSize, *python, scriptPath, log)
+	configPath, err := filepath.Abs(*configF)
+	if err != nil {
+		log.Error("resolve config path", "err", err)
+		os.Exit(1)
+	}
+	settings := loadSettings(configPath, log)
+
+	if *maxCompress <= *deadline {
+		log.Warn("max-compress should exceed deadline; slow calls will be killed before the client's fail-open",
+			"max_compress", *maxCompress, "deadline", *deadline)
+	}
+
+	pool := NewPool(*poolSize, *python, scriptPath, configPath, *maxCompress, log)
 	defer pool.Shutdown()
 
 	handler := &Handler{
 		comp:     pool,
+		settings: settings,
 		deadline: *deadline,
 		log:      log,
 		verbose:  *verbose,
 		out:      os.Stdout,
 	}
-	httpSrv := &http.Server{Handler: handler}
+
+	// /config is the runtime tuning API; everything else is the aperture hook.
+	mux := http.NewServeMux()
+	mux.Handle("/config", &configHandler{store: settings, log: log})
+	mux.Handle("/", handler)
+	httpSrv := &http.Server{Handler: mux}
 
 	ln, cleanup, err := listen(*localAddr, *addr, *hostname, *stateDir, log)
 	if err != nil {
@@ -78,7 +98,9 @@ func main() {
 		"addr", listenAddr(*localAddr, *addr),
 		"pool_size", *poolSize,
 		"deadline", *deadline,
+		"max_compress", *maxCompress,
 		"python", *python,
+		"config", configPath,
 		"verbose", *verbose,
 	)
 

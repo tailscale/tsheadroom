@@ -48,23 +48,21 @@ def _result_to_dict(result: Any) -> dict[str, Any]:
 def _compress(payload: dict[str, Any]) -> dict[str, Any]:
     """Run one compression. `messages` is required; `model` is optional
     (absent/empty -> let `compress` use its own default, which only drives
-    tokenizer/limit selection)."""
+    tokenizer/limit selection); `config` carries the tunable CompressConfig
+    knobs (compress_user_messages, target_ratio, protect_recent, etc.) sent by
+    the Go side and forwarded straight through as kwargs."""
     messages = payload.get("messages")
     if not isinstance(messages, list):
         raise ValueError("payload.messages must be a list")
 
+    config = payload.get("config")
+    kwargs: dict[str, Any] = dict(config) if isinstance(config, dict) else {}
+
     model = payload.get("model")
-
-    # v1 calls compress bare. Config knobs are available as kwargs and mirror
-    # Headroom's CompressConfig / the proxy's /v1/compress `config` field:
-    #   compress_user_messages, target_ratio, protect_recent,
-    #   protect_analysis_context (also model_limit for non-200k-context models).
-    # We will surface these selectively as server flags in a later iteration.
     if model:
-        result = compress(messages, model=model)
-    else:
-        result = compress(messages)
+        kwargs["model"] = model
 
+    result = compress(messages, **kwargs)
     return _result_to_dict(result)
 
 
@@ -74,16 +72,42 @@ def _emit(obj: dict[str, Any]) -> None:
     sys.stdout.flush()
 
 
-def main() -> int:
-    # Warm the lazily-built singleton pipeline so the first real request does
-    # not pay the import/build cost. A tiny dummy compress forces _get_pipeline().
+def _text_compression_enabled() -> bool:
+    """Read the config file named by TSHEADROOM_CONFIG (if any) and report
+    whether a text knob is on — i.e. whether the ML text compressor (Kompress)
+    will be exercised, and therefore worth preloading at startup."""
+    import os
+
+    path = os.environ.get("TSHEADROOM_CONFIG")
+    if not path:
+        return False
     try:
-        compress([{"role": "user", "content": "warmup"}])
+        with open(path) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return False
+    return bool(cfg.get("compress_user_messages")) or cfg.get("target_ratio") is not None
+
+
+def _warmup() -> None:
+    """Warm the pipeline so the first real request doesn't pay the build cost.
+
+    Always builds the (lazy) pipeline. When the config enables text compression,
+    also runs a sizable user-message compress to force the ML model (Kompress)
+    to load now — otherwise that multi-second load would land on the first real
+    request. Best-effort: failures here never block serving."""
+    try:
+        if _text_compression_enabled():
+            big = "The system processes the request and returns a response. " * 80
+            compress([{"role": "user", "content": big}], compress_user_messages=True)
+        else:
+            compress([{"role": "user", "content": "warmup"}])
     except Exception:
-        # Warmup is best-effort; a failure here shouldn't prevent us from
-        # serving (and would resurface per-request anyway).
         pass
 
+
+def main() -> int:
+    _warmup()
     _emit({"ready": True})
 
     for line in sys.stdin:

@@ -18,7 +18,7 @@ sys.path.insert(0, ROOT)
 # Shadow headroom with a stub so `import worker` is fast and dependency-free.
 # Tests override worker.compress directly, so the stub body is never used.
 _stub = types.ModuleType("headroom")
-_stub.compress = lambda messages, model=None: None  # noqa: E731
+_stub.compress = lambda messages, **kwargs: None  # noqa: E731
 sys.modules.setdefault("headroom", _stub)
 
 import worker  # noqa: E402
@@ -47,14 +47,17 @@ class WorkerLogicTest(unittest.TestCase):
         self._orig = worker.compress
         self.calls = []
 
-        def recorder(messages, model="SENTINEL_DEFAULT"):
-            self.calls.append({"messages": messages, "model": model})
+        def recorder(messages, **kwargs):
+            self.calls.append({"messages": messages, "kwargs": kwargs})
             return fake_result(messages=[{"ok": True}], tokens_saved=7)
 
         worker.compress = recorder
 
     def tearDown(self):
         worker.compress = self._orig
+
+    def last_kwargs(self):
+        return self.calls[-1]["kwargs"]
 
     def test_result_to_dict_projects_fields(self):
         r = fake_result(
@@ -79,17 +82,34 @@ class WorkerLogicTest(unittest.TestCase):
 
     def test_passes_model_when_present(self):
         out = worker._compress({"messages": [{"role": "user"}], "model": "gpt-4o"})
-        self.assertEqual(self.calls[-1]["model"], "gpt-4o")
+        self.assertEqual(self.last_kwargs().get("model"), "gpt-4o")
         self.assertEqual(out["tokens_saved"], 7)
 
-    def test_falls_back_to_default_when_model_absent(self):
+    def test_omits_model_when_absent(self):
+        # No model kwarg forwarded -> headroom uses its own default.
         worker._compress({"messages": [{"role": "user"}]})
-        # model kwarg omitted -> recorder's own default observed
-        self.assertEqual(self.calls[-1]["model"], "SENTINEL_DEFAULT")
+        self.assertNotIn("model", self.last_kwargs())
 
-    def test_falls_back_to_default_when_model_empty(self):
+    def test_omits_model_when_empty(self):
         worker._compress({"messages": [{"role": "user"}], "model": ""})
-        self.assertEqual(self.calls[-1]["model"], "SENTINEL_DEFAULT")
+        self.assertNotIn("model", self.last_kwargs())
+
+    def test_forwards_config_kwargs(self):
+        cfg = {"compress_user_messages": True, "protect_recent": 0, "target_ratio": 0.3}
+        worker._compress({"messages": [{"role": "user"}], "model": "m", "config": cfg})
+        k = self.last_kwargs()
+        self.assertEqual(k.get("model"), "m")
+        self.assertTrue(k["compress_user_messages"])
+        self.assertEqual(k["protect_recent"], 0)
+        self.assertEqual(k["target_ratio"], 0.3)
+
+    def test_no_config_means_no_extra_kwargs(self):
+        worker._compress({"messages": [{"role": "user"}]})
+        self.assertEqual(self.last_kwargs(), {})
+
+    def test_non_dict_config_ignored(self):
+        worker._compress({"messages": [{"role": "user"}], "config": "nope"})
+        self.assertEqual(self.last_kwargs(), {})
 
     def test_non_list_messages_raises(self):
         with self.assertRaises(ValueError):
@@ -98,6 +118,63 @@ class WorkerLogicTest(unittest.TestCase):
     def test_missing_messages_raises(self):
         with self.assertRaises(ValueError):
             worker._compress({})
+
+
+class WarmupTest(unittest.TestCase):
+    def setUp(self):
+        self._orig = worker.compress
+        self._orig_env = os.environ.get("TSHEADROOM_CONFIG")
+        self.calls = []
+
+        def recorder(messages, **kwargs):
+            self.calls.append({"messages": messages, "kwargs": kwargs})
+            return fake_result()
+
+        worker.compress = recorder
+
+    def tearDown(self):
+        worker.compress = self._orig
+        if self._orig_env is None:
+            os.environ.pop("TSHEADROOM_CONFIG", None)
+        else:
+            os.environ["TSHEADROOM_CONFIG"] = self._orig_env
+
+    def _write_cfg(self, cfg):
+        import json as _json
+        import tempfile
+
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w") as f:
+            _json.dump(cfg, f)
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        os.environ["TSHEADROOM_CONFIG"] = path
+        return path
+
+    def test_text_enabled_detection(self):
+        os.environ.pop("TSHEADROOM_CONFIG", None)
+        self.assertFalse(worker._text_compression_enabled())  # no env
+
+        self._write_cfg({"compress_user_messages": False})
+        self.assertFalse(worker._text_compression_enabled())
+
+        self._write_cfg({"compress_user_messages": True})
+        self.assertTrue(worker._text_compression_enabled())
+
+        self._write_cfg({"compress_user_messages": False, "target_ratio": 0.5})
+        self.assertTrue(worker._text_compression_enabled())
+
+    def test_warmup_preloads_when_text_enabled(self):
+        self._write_cfg({"compress_user_messages": True})
+        worker._warmup()
+        # A sizable user-message compress with the text knob forces model load.
+        self.assertTrue(self.calls[-1]["kwargs"].get("compress_user_messages"))
+        self.assertGreater(len(self.calls[-1]["messages"][0]["content"]), 100)
+
+    def test_warmup_light_when_text_disabled(self):
+        os.environ.pop("TSHEADROOM_CONFIG", None)
+        worker._warmup()
+        # Just builds the pipeline; no text knob forced.
+        self.assertNotIn("compress_user_messages", self.calls[-1]["kwargs"])
 
 
 if __name__ == "__main__":

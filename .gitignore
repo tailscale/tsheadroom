@@ -9,6 +9,13 @@
 __pycache__/
 *.pyc
 
+# Syncthing folder marker
+.stfolder/
+
+# Runtime compress-config written by PUT /config (default -config path)
+/tsheadroom.config.json
+*.config.json.tmp
+
 # tsnet state — contains tailscaled.state (the node's private key). Never commit.
 # `t/` is the conventional local -state-dir; also guard the state files by name.
 /t/

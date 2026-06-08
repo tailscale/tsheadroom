@@ -39,6 +39,7 @@ type compressor interface {
 // problem so it can never break a user's request.
 type Handler struct {
 	comp     compressor
+	settings *settingsStore // current compress knobs, read per request
 	deadline time.Duration
 	log      *slog.Logger // operational logs + warnings (stderr)
 
@@ -65,7 +66,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(h.out, "request in_msgs=%d in_bytes=%d out_bytes=%d -> %s\n",
 			s.inMessages, s.inBytes, s.outBytes, resp.Action)
 	}
-	h.writeJSON(w, resp)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // process reads the hook call, runs compression, and returns the guardrail
@@ -111,7 +112,11 @@ func (h *Handler) process(r *http.Request) (guardrailResponse, summary) {
 	ctx, cancel := context.WithTimeout(r.Context(), h.deadline)
 	defer cancel()
 
-	res, err := h.comp.Compress(ctx, compressRequest{Messages: messages, Model: model})
+	res, err := h.comp.Compress(ctx, compressRequest{
+		Messages: messages,
+		Model:    model,
+		Config:   h.settings.get(),
+	})
 	if err != nil {
 		h.log.Warn("compress failed; allowing", "err", err)
 		return allow, s
@@ -136,11 +141,4 @@ func jsonLen(v any) int {
 		return 0
 	}
 	return len(b)
-}
-
-func (h *Handler) writeJSON(w http.ResponseWriter, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(v); err != nil {
-		h.log.Warn("encode response failed", "err", err)
-	}
 }

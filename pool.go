@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"os/exec"
 	"sync"
 	"syscall"
@@ -15,10 +16,12 @@ import (
 )
 
 // compressRequest is the payload sent to a worker. Messages is required;
-// Model is optional (the worker lets headroom pick a default when empty).
+// Model is optional (the worker lets headroom pick a default when empty);
+// Config carries the runtime-tunable compress knobs.
 type compressRequest struct {
-	Messages []any  `json:"messages"`
-	Model    string `json:"model,omitempty"`
+	Messages []any            `json:"messages"`
+	Model    string           `json:"model,omitempty"`
+	Config   CompressSettings `json:"config"`
 }
 
 // compressResult mirrors the fields worker.py projects from headroom's
@@ -53,9 +56,10 @@ const (
 	maxBackoff         = 10 * time.Second
 )
 
-// job is one unit of work handed to a slot goroutine.
+// job is one unit of work handed to a slot goroutine. It carries no context:
+// the client's fail-open deadline is enforced by Compress's own select, while
+// the worker runs under the pool's hard cap (see runSlot).
 type job struct {
-	ctx  context.Context
 	req  compressRequest
 	resp chan jobResult
 }
@@ -72,9 +76,10 @@ type jobResult struct {
 // channel, which doubles as backpressure: Compress blocks (until its deadline)
 // when every slot is busy.
 type Pool struct {
-	jobs   chan job
-	newCmd func() *exec.Cmd // builds a fresh worker process
-	log    *slog.Logger
+	jobs        chan job
+	newCmd      func() *exec.Cmd // builds a fresh worker process
+	maxCompress time.Duration    // hard cap on a single worker call before recycle
+	log         *slog.Logger
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -82,24 +87,30 @@ type Pool struct {
 }
 
 // NewPool starts `size` slot goroutines, each spawning and supervising a worker
-// launched as `python -u script`.
-func NewPool(size int, python, script string, log *slog.Logger) *Pool {
+// launched as `python -u script`. maxCompress is the hard cap on a single
+// worker call (see runSlot) — distinct from the caller's fail-open deadline.
+// configPath is passed to the worker via TSHEADROOM_CONFIG so it can preload the
+// ML model at startup when the persisted config enables a text knob.
+func NewPool(size int, python, script, configPath string, maxCompress time.Duration, log *slog.Logger) *Pool {
 	return newPool(size, func() *exec.Cmd {
-		return exec.Command(python, "-u", script)
-	}, log)
+		cmd := exec.Command(python, "-u", script)
+		cmd.Env = append(os.Environ(), "TSHEADROOM_CONFIG="+configPath)
+		return cmd
+	}, maxCompress, log)
 }
 
 // newPool is the testable core: it takes a command factory so tests can
 // substitute a fake worker (e.g. the os/exec TestHelperProcess pattern) without
 // requiring a Python interpreter.
-func newPool(size int, newCmd func() *exec.Cmd, log *slog.Logger) *Pool {
+func newPool(size int, newCmd func() *exec.Cmd, maxCompress time.Duration, log *slog.Logger) *Pool {
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &Pool{
-		jobs:   make(chan job),
-		newCmd: newCmd,
-		log:    log,
-		ctx:    ctx,
-		cancel: cancel,
+		jobs:        make(chan job),
+		newCmd:      newCmd,
+		maxCompress: maxCompress,
+		log:         log,
+		ctx:         ctx,
+		cancel:      cancel,
 	}
 	for i := 0; i < size; i++ {
 		p.wg.Add(1)
@@ -108,11 +119,14 @@ func newPool(size int, newCmd func() *exec.Cmd, log *slog.Logger) *Pool {
 	return p
 }
 
-// Compress submits a job and waits for the result, bounded by ctx. A ctx
-// deadline can fire either while waiting for a free slot or while a worker
-// processes the request; both surface as an error so the caller fails open.
+// Compress submits a job and waits for the result, bounded by ctx (the client's
+// fail-open deadline). If ctx fires — while waiting for a free slot or while the
+// worker is still running — the caller gets an error and fails open, but the
+// worker keeps running under the pool's hard cap (see runSlot). That lets a slow
+// first call (e.g. a one-time model load) finish and leave the worker warm, so
+// the next call succeeds — no restart needed.
 func (p *Pool) Compress(ctx context.Context, req compressRequest) (*compressResult, error) {
-	j := job{ctx: ctx, req: req, resp: make(chan jobResult, 1)}
+	j := job{req: req, resp: make(chan jobResult, 1)}
 	select {
 	case p.jobs <- j:
 	case <-ctx.Done():
@@ -128,8 +142,8 @@ func (p *Pool) Compress(ctx context.Context, req compressRequest) (*compressResu
 	}
 }
 
-// Shutdown stops all slots and their workers. Slots blocked on a job finish it
-// first (bounded by the job's deadline), then tear down their worker.
+// Shutdown stops all slots and their workers. A slot mid-call finishes it first
+// (bounded by the hard cap), then tears down its worker.
 func (p *Pool) Shutdown() {
 	p.cancel()
 	p.wg.Wait()
@@ -156,10 +170,16 @@ func (p *Pool) runSlot(idx int) {
 					return // spawn only returns nil on pool shutdown
 				}
 			}
-			res, err := w.do(j.ctx, j.req)
+			// Run under the pool's hard cap, NOT the client's deadline. The
+			// client already fails open on its own ctx in Compress; here we let
+			// the worker keep going so a slow call (e.g. a model load) finishes
+			// and leaves the worker warm. Only a real error or the hard cap
+			// (genuinely wedged) recycles the worker. j.resp is buffered, so the
+			// send never blocks even after the client has given up.
+			hardCtx, cancel := context.WithTimeout(p.ctx, p.maxCompress)
+			res, err := w.do(hardCtx, j.req)
+			cancel()
 			if err != nil {
-				// The worker is suspect (crash, timeout, or protocol error):
-				// kill it and bring up a fresh one for the next job.
 				p.log.Warn("worker request failed; recycling", "slot", idx, "err", err)
 				w.kill()
 				w = p.spawn(idx)
