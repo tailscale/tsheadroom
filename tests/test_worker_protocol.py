@@ -1,3 +1,6 @@
+# Copyright (c) Tailscale Inc & AUTHORS
+# SPDX-License-Identifier: BSD-3-Clause
+
 """Black-box test of worker.py's stdin/stdout protocol loop.
 
 Runs the real worker.py as a subprocess, but with the fake headroom fixture on

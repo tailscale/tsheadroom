@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
+
 // Command tsheadroom is an aperture pre_request guardrail hook that compresses
 // LLM request bodies with Headroom. It listens on the tailnet via tsnet and,
 // for each hook call, hands request_body.messages to a pool of persistent

@@ -1,3 +1,6 @@
+# Copyright (c) Tailscale Inc & AUTHORS
+# SPDX-License-Identifier: BSD-3-Clause
+
 """Integration test against the REAL headroom package.
 
 Skipped automatically unless the interpreter running the tests has headroom-ai

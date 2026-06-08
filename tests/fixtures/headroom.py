@@ -1,3 +1,6 @@
+# Copyright (c) Tailscale Inc & AUTHORS
+# SPDX-License-Identifier: BSD-3-Clause
+
 """A fake `headroom` module for deterministic worker protocol tests.
 
 Put this directory on PYTHONPATH ahead of any real install so that

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) Tailscale Inc & AUTHORS
+# SPDX-License-Identifier: BSD-3-Clause
+
 """Headroom compression worker.
 
 A long-lived process that the Go supervisor spawns and talks to over

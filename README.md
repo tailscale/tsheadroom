@@ -270,3 +270,15 @@ make test PYTHON=/opt/tsheadroom/venv/bin/python  # also runs the real-headroom 
 Go tests use a fake worker (no Python needed); Python tests use a fake
 `headroom` by default and run the real-headroom integration test only when
 `$PYTHON` has `headroom-ai` installed.
+
+## Contributing
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). We require a
+DCO `Signed-off-by` line on commits (`git commit -s`), and every source file
+carries the Tailscale copyright/SPDX header (enforced by `TestLicenseHeaders`).
+Please follow the [Code of Conduct](CODE_OF_CONDUCT.md). Report security issues
+privately per [SECURITY.md](SECURITY.md).
+
+## License
+
+BSD 3-Clause. See [LICENSE](LICENSE).
