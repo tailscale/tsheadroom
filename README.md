@@ -19,7 +19,7 @@ request passes through unchanged. **It never blocks a request.**
 Aperture --(pre_request hook: POST /)--> tsheadroom (tsnet :80)
                                               │
                                               ├─ pool of persistent Python workers
-                                              │     each runs: headroom.compress(messages, model)
+                                              │     each runs: headroom.compress(messages, model, **config)
                                               │
                                               └─ reply: {"action":"modify","request_body":{…}}
                                                      or  {"action":"allow"}
@@ -99,6 +99,11 @@ path `/`. Other tailnet nodes (including Aperture) reach it at
 systemd `StateDirectory`). It contains `tailscaled.state`, the node's **private
 key** — treat it as a secret and keep it on durable storage, or the node
 re-authenticates as a new node on every restart.
+
+**Config path:** `-config` defaults to `tsheadroom.config.json` resolved against
+the **current working directory**. In a service, set it to an absolute path
+(e.g. under your state dir) so a different launch CWD doesn't read/write a
+different file.
 
 ### Quick local test (no tailnet)
 
@@ -234,8 +239,13 @@ The result: enabling text compression at runtime via `PUT /config` costs **at
 most one** uncompressed (`allow`) request while the model loads, then it works —
 **no restart needed**. To avoid even that one, workers **preload** the model at
 startup whenever the persisted config has a text knob enabled (so new/restarted
-workers come up warm). The first cold start downloads the model, which can take
-a while; the worker only reports ready once it's loaded.
+workers come up warm).
+
+The model is downloaded from HuggingFace on first ever use (cached under
+`~/.cache/huggingface` thereafter). A worker has ~60s to report ready, so a slow
+*cold* download on a fresh host can exceed that and make workers retry; warm the
+cache once (start with a text knob on, or run a single `compress` under the
+worker's interpreter) before serving production traffic.
 
 ## What actually gets compressed
 
@@ -244,6 +254,10 @@ By default Headroom uses a conservative coding-agent profile: it compresses
 content, but **protects user messages, the system prompt, and the most recent
 turns**. So short chats — even long *prose* in a user message — return `allow`.
 You'll see `modify` when a request carries a substantial tool result.
+
+v1 only inspects the `messages` array (Anthropic/OpenAI shape). A request body
+without one — e.g. Gemini's `contents`, or an embeddings call — passes through
+unchanged (`allow`); only `messages` is ever rewritten.
 
 ## Development
 

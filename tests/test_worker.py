@@ -123,7 +123,7 @@ class WorkerLogicTest(unittest.TestCase):
 class WarmupTest(unittest.TestCase):
     def setUp(self):
         self._orig = worker.compress
-        self._orig_env = os.environ.get("TSHEADROOM_CONFIG")
+        self._orig_env = os.environ.get("TSHEADROOM_PRELOAD")
         self.calls = []
 
         def recorder(messages, **kwargs):
@@ -135,43 +135,27 @@ class WarmupTest(unittest.TestCase):
     def tearDown(self):
         worker.compress = self._orig
         if self._orig_env is None:
-            os.environ.pop("TSHEADROOM_CONFIG", None)
+            os.environ.pop("TSHEADROOM_PRELOAD", None)
         else:
-            os.environ["TSHEADROOM_CONFIG"] = self._orig_env
+            os.environ["TSHEADROOM_PRELOAD"] = self._orig_env
 
-    def _write_cfg(self, cfg):
-        import json as _json
-        import tempfile
+    def test_preload_requested_reads_env(self):
+        os.environ.pop("TSHEADROOM_PRELOAD", None)
+        self.assertFalse(worker._preload_requested())
+        os.environ["TSHEADROOM_PRELOAD"] = "0"
+        self.assertFalse(worker._preload_requested())
+        os.environ["TSHEADROOM_PRELOAD"] = "1"
+        self.assertTrue(worker._preload_requested())
 
-        fd, path = tempfile.mkstemp(suffix=".json")
-        with os.fdopen(fd, "w") as f:
-            _json.dump(cfg, f)
-        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
-        os.environ["TSHEADROOM_CONFIG"] = path
-        return path
-
-    def test_text_enabled_detection(self):
-        os.environ.pop("TSHEADROOM_CONFIG", None)
-        self.assertFalse(worker._text_compression_enabled())  # no env
-
-        self._write_cfg({"compress_user_messages": False})
-        self.assertFalse(worker._text_compression_enabled())
-
-        self._write_cfg({"compress_user_messages": True})
-        self.assertTrue(worker._text_compression_enabled())
-
-        self._write_cfg({"compress_user_messages": False, "target_ratio": 0.5})
-        self.assertTrue(worker._text_compression_enabled())
-
-    def test_warmup_preloads_when_text_enabled(self):
-        self._write_cfg({"compress_user_messages": True})
+    def test_warmup_preloads_when_requested(self):
+        os.environ["TSHEADROOM_PRELOAD"] = "1"
         worker._warmup()
         # A sizable user-message compress with the text knob forces model load.
         self.assertTrue(self.calls[-1]["kwargs"].get("compress_user_messages"))
         self.assertGreater(len(self.calls[-1]["messages"][0]["content"]), 100)
 
-    def test_warmup_light_when_text_disabled(self):
-        os.environ.pop("TSHEADROOM_CONFIG", None)
+    def test_warmup_light_when_not_requested(self):
+        os.environ.pop("TSHEADROOM_PRELOAD", None)
         worker._warmup()
         # Just builds the pipeline; no text knob forced.
         self.assertNotIn("compress_user_messages", self.calls[-1]["kwargs"])

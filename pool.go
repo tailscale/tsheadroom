@@ -50,11 +50,15 @@ type responseEnvelope struct {
 }
 
 const (
-	workerReadyTimeout = 60 * time.Second // import headroom + warm the pipeline
-	shutdownGrace      = 5 * time.Second
-	initialBackoff     = 200 * time.Millisecond
-	maxBackoff         = 10 * time.Second
+	shutdownGrace  = 5 * time.Second
+	initialBackoff = 200 * time.Millisecond
+	maxBackoff     = 10 * time.Second
 )
+
+// workerReadyTimeout bounds how long startWorker waits for a worker's
+// {"ready":true} line (import headroom + warm/preload the pipeline). It's a var
+// so tests can shrink it; production never changes it.
+var workerReadyTimeout = 60 * time.Second
 
 // job is one unit of work handed to a slot goroutine. It carries no context:
 // the client's fail-open deadline is enforced by Compress's own select, while
@@ -89,12 +93,18 @@ type Pool struct {
 // NewPool starts `size` slot goroutines, each spawning and supervising a worker
 // launched as `python -u script`. maxCompress is the hard cap on a single
 // worker call (see runSlot) — distinct from the caller's fail-open deadline.
-// configPath is passed to the worker via TSHEADROOM_CONFIG so it can preload the
-// ML model at startup when the persisted config enables a text knob.
-func NewPool(size int, python, script, configPath string, maxCompress time.Duration, log *slog.Logger) *Pool {
+// preload is consulted at each spawn: when it returns true the worker is told
+// (via TSHEADROOM_PRELOAD=1) to load the ML model at startup, so the decision of
+// what counts as "text compression enabled" lives in one place (Go), and a
+// worker respawned after a runtime config change picks up the current answer.
+func NewPool(size int, python, script string, preload func() bool, maxCompress time.Duration, log *slog.Logger) *Pool {
 	return newPool(size, func() *exec.Cmd {
 		cmd := exec.Command(python, "-u", script)
-		cmd.Env = append(os.Environ(), "TSHEADROOM_CONFIG="+configPath)
+		v := "0"
+		if preload != nil && preload() {
+			v = "1"
+		}
+		cmd.Env = append(os.Environ(), "TSHEADROOM_PRELOAD="+v)
 		return cmd
 	}, maxCompress, log)
 }
@@ -283,41 +293,56 @@ func startWorker(newCmd func() *exec.Cmd, slot int, log *slog.Logger) (*worker, 
 	return w, nil
 }
 
-// awaitReady reads lines until the worker announces readiness, bounded by
-// workerReadyTimeout.
-func (w *worker) awaitReady() error {
-	type lineRes struct {
-		line []byte
-		err  error
-	}
+type lineRes struct {
+	line []byte
+	err  error
+}
+
+// readLine reads one newline-delimited line from the worker, bounded by ctx.
+// The blocking read runs in a goroutine so ctx cancellation returns promptly;
+// that goroutine is reclaimed when the stream finally yields a line or the
+// stdout pipe closes (which the slot guarantees by killing a worker whose call
+// was abandoned). Uses ReadBytes (not bufio.Scanner) so lines can be arbitrarily
+// large — a modified body can approach the 50 MiB cap.
+func (w *worker) readLine(ctx context.Context) ([]byte, error) {
 	ch := make(chan lineRes, 1)
 	go func() {
 		line, err := w.stdout.ReadBytes('\n')
 		ch <- lineRes{line, err}
 	}()
-
-	timer := time.NewTimer(workerReadyTimeout)
-	defer timer.Stop()
 	select {
-	case <-timer.C:
-		return errors.New("timed out waiting for worker ready")
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	case r := <-ch:
-		if r.err != nil {
-			return fmt.Errorf("reading ready line: %w", r.err)
-		}
-		var msg struct {
-			Ready bool `json:"ready"`
-		}
-		if err := json.Unmarshal(r.line, &msg); err != nil || !msg.Ready {
-			return fmt.Errorf("unexpected first line from worker: %s", truncate(r.line))
-		}
-		return nil
+		return r.line, r.err
 	}
 }
 
-// do sends one request and reads its response, bounded by ctx. On ctx
-// expiry the caller (slot) recycles the worker, which closes stdout and
-// unblocks the read goroutine — so no goroutine leaks.
+// awaitReady blocks until the worker announces readiness, bounded by
+// workerReadyTimeout.
+func (w *worker) awaitReady() error {
+	ctx, cancel := context.WithTimeout(context.Background(), workerReadyTimeout)
+	defer cancel()
+
+	line, err := w.readLine(ctx)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return errors.New("timed out waiting for worker ready")
+		}
+		return fmt.Errorf("reading ready line: %w", err)
+	}
+	var msg struct {
+		Ready bool `json:"ready"`
+	}
+	if err := json.Unmarshal(line, &msg); err != nil || !msg.Ready {
+		return fmt.Errorf("unexpected first line from worker: %s", truncate(line))
+	}
+	return nil
+}
+
+// do sends one request and reads its response, bounded by ctx. On ctx expiry
+// the caller (slot) recycles the worker, which closes stdout and unblocks the
+// read goroutine — so no goroutine leaks.
 func (w *worker) do(ctx context.Context, req compressRequest) (*compressResult, error) {
 	w.nextID++
 	id := w.nextID
@@ -331,36 +356,33 @@ func (w *worker) do(ctx context.Context, req compressRequest) (*compressResult, 
 		return nil, fmt.Errorf("write to worker: %w", err)
 	}
 
-	type lineRes struct {
-		line []byte
-		err  error
+	line, err := w.readLine(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read from worker: %w", err)
 	}
-	ch := make(chan lineRes, 1)
-	go func() {
-		line, err := w.stdout.ReadBytes('\n')
-		ch <- lineRes{line, err}
-	}()
-
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case r := <-ch:
-		if r.err != nil {
-			return nil, fmt.Errorf("read from worker: %w", r.err)
-		}
-		var resp responseEnvelope
-		if err := json.Unmarshal(r.line, &resp); err != nil {
-			return nil, fmt.Errorf("decode response: %w", err)
-		}
-		if !resp.OK {
-			return nil, fmt.Errorf("worker error (%s): %s", resp.ErrorType, resp.Error)
-		}
-		return resp.Result, nil
+	var resp responseEnvelope
+	if err := json.Unmarshal(line, &resp); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
 	}
+	// Defend the one-in-flight invariant: a mismatched id means the stream
+	// desynced (e.g. a stray line on stdout), so recycle rather than return a
+	// response that belongs to a different request.
+	if resp.ID != id {
+		return nil, fmt.Errorf("response id mismatch: got %d, want %d", resp.ID, id)
+	}
+	if !resp.OK {
+		return nil, fmt.Errorf("worker error (%s): %s", resp.ErrorType, resp.Error)
+	}
+	if resp.Result == nil {
+		return nil, fmt.Errorf("worker reported ok but returned no result")
+	}
+	return resp.Result, nil
 }
 
-// shutdown asks the worker to exit cleanly (EOF on stdin), then kills the
-// process group if it overstays the grace period.
+// shutdown asks the worker to exit cleanly (EOF on stdin), then SIGKILLs the
+// process group if it overstays the grace period. cmd.Wait runs in exactly one
+// place (the reaper goroutine) — signalKill never calls Wait, so there is no
+// concurrent/double Wait on the same Cmd.
 func (w *worker) shutdown() {
 	_ = w.stdin.Close()
 	done := make(chan struct{})
@@ -370,17 +392,26 @@ func (w *worker) shutdown() {
 	}()
 	select {
 	case <-done:
+		return
 	case <-time.After(shutdownGrace):
-		w.kill()
 	}
+	w.signalKill() // force the group down; the reaper goroutine above reaps it
+	<-done
 }
 
-// kill SIGKILLs the worker's whole process group and reaps it.
-func (w *worker) kill() {
+// signalKill SIGKILLs the worker's whole process group without reaping it.
+func (w *worker) signalKill() {
 	if w.cmd.Process != nil {
 		// Negative pid → signal the process group created by Setpgid.
 		_ = syscall.Kill(-w.cmd.Process.Pid, syscall.SIGKILL)
 	}
+}
+
+// kill SIGKILLs the worker and reaps it. Use only on the recycle path, where no
+// other Wait is outstanding for this worker (shutdown() reaps via its own
+// goroutine instead).
+func (w *worker) kill() {
+	w.signalKill()
 	_ = w.cmd.Wait()
 }
 

@@ -10,9 +10,15 @@ knowledge lives in the Go handler, never here.
 Protocol (newline-delimited JSON, one object per line):
 
   startup, once ready:   {"ready": true}
-  request  (Go -> here): {"id": <int>, "payload": {"messages": [...], "model": "..."}}
+  request  (Go -> here): {"id": <int>, "payload": {"messages": [...], "model": "...",
+                                                    "config": {...CompressConfig knobs...}}}
   response (here -> Go): {"id": <int>, "ok": true,  "result": {...CompressResult...}}
                          {"id": <int>, "ok": false, "error": "...", "error_type": "..."}
+
+`config` is optional and forwarded straight to compress() as kwargs. On startup,
+if $TSHEADROOM_PRELOAD=1 (set by the Go parent when text compression is enabled),
+the ML model is preloaded (see _warmup) so the first real request doesn't pay the
+load. fd 1 is reserved exclusively for the protocol — see main().
 
 Invariants:
   - exactly one request is in flight at a time (the stream is ordered);
@@ -27,10 +33,16 @@ environment has `headroom` installed.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from typing import Any
 
 from headroom import compress
+
+# The protocol stream. main() repoints this at a private dup of the original
+# stdout and redirects fd 1 to stderr, so library output (HF/transformers/torch
+# progress, stray prints) can never corrupt the NDJSON the Go parent reads.
+_proto = sys.stdout
 
 
 def _result_to_dict(result: Any) -> dict[str, Any]:
@@ -67,37 +79,27 @@ def _compress(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _emit(obj: dict[str, Any]) -> None:
-    sys.stdout.write(json.dumps(obj))
-    sys.stdout.write("\n")
-    sys.stdout.flush()
+    _proto.write(json.dumps(obj))
+    _proto.write("\n")
+    _proto.flush()
 
 
-def _text_compression_enabled() -> bool:
-    """Read the config file named by TSHEADROOM_CONFIG (if any) and report
-    whether a text knob is on — i.e. whether the ML text compressor (Kompress)
-    will be exercised, and therefore worth preloading at startup."""
-    import os
-
-    path = os.environ.get("TSHEADROOM_CONFIG")
-    if not path:
-        return False
-    try:
-        with open(path) as f:
-            cfg = json.load(f)
-    except (OSError, ValueError):
-        return False
-    return bool(cfg.get("compress_user_messages")) or cfg.get("target_ratio") is not None
+def _preload_requested() -> bool:
+    """Whether the Go parent asked us to preload the ML model at startup. The
+    'is text compression enabled' decision is made once, in Go, and passed via
+    TSHEADROOM_PRELOAD so the two sides can't drift."""
+    return os.environ.get("TSHEADROOM_PRELOAD") == "1"
 
 
 def _warmup() -> None:
     """Warm the pipeline so the first real request doesn't pay the build cost.
 
-    Always builds the (lazy) pipeline. When the config enables text compression,
-    also runs a sizable user-message compress to force the ML model (Kompress)
-    to load now — otherwise that multi-second load would land on the first real
-    request. Best-effort: failures here never block serving."""
+    Always builds the (lazy) pipeline. When preload is requested, also runs a
+    sizable user-message compress to force the ML model (Kompress) to load now —
+    otherwise that multi-second load would land on the first real request.
+    Best-effort: failures here never block serving."""
     try:
-        if _text_compression_enabled():
+        if _preload_requested():
             big = "The system processes the request and returns a response. " * 80
             compress([{"role": "user", "content": big}], compress_user_messages=True)
         else:
@@ -107,6 +109,14 @@ def _warmup() -> None:
 
 
 def main() -> int:
+    # Isolate the protocol stream: keep a private handle to the real stdout for
+    # NDJSON, then point fd 1 at stderr so any library that writes to stdout
+    # can't inject a rogue line into the protocol.
+    global _proto
+    sys.stdout.flush()
+    _proto = os.fdopen(os.dup(1), "w")
+    os.dup2(2, 1)  # fd 1 -> stderr; print()/library stdout now go to stderr
+
     _warmup()
     _emit({"ready": True})
 

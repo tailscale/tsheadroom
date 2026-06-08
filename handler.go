@@ -105,9 +105,14 @@ func (h *Handler) process(r *http.Request) (guardrailResponse, summary) {
 	}
 	model, _ := reqBody["model"].(string) // absent/non-string -> worker default
 
+	// Byte sizes are only used for the -v summary; skip the marshal otherwise
+	// (messages can be multi-MB). The message count is cheap, so keep it.
 	// For an allow result, output size equals input size (body unchanged).
-	inBytes := jsonLen(messages)
-	s := summary{inMessages: len(messages), inBytes: inBytes, outBytes: inBytes}
+	s := summary{inMessages: len(messages)}
+	if h.verbose {
+		s.inBytes = jsonLen(messages)
+		s.outBytes = s.inBytes
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), h.deadline)
 	defer cancel()
@@ -130,7 +135,9 @@ func (h *Handler) process(r *http.Request) (guardrailResponse, summary) {
 	// field pass through unchanged. Headroom compresses tool_use/tool_result
 	// content inside messages, so tool calls are already covered here.
 	reqBody["messages"] = res.Messages
-	s.outBytes = jsonLen(res.Messages)
+	if h.verbose {
+		s.outBytes = jsonLen(res.Messages)
+	}
 	return guardrailResponse{Action: "modify", RequestBody: reqBody}, s
 }
 

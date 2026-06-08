@@ -62,7 +62,12 @@ func main() {
 			"max_compress", *maxCompress, "deadline", *deadline)
 	}
 
-	pool := NewPool(*poolSize, *python, scriptPath, configPath, *maxCompress, log)
+	// Workers preload the ML model at startup when text compression is enabled;
+	// the decision lives here (single source of truth) and is re-evaluated at
+	// each spawn, so a worker respawned after a runtime change is up to date.
+	pool := NewPool(*poolSize, *python, scriptPath, func() bool {
+		return settings.get().textEnabled()
+	}, *maxCompress, log)
 	defer pool.Shutdown()
 
 	handler := &Handler{

@@ -60,6 +60,12 @@ func (s CompressSettings) validate() error {
 	return nil
 }
 
+// textEnabled reports whether a knob that drives the ML text compressor
+// (Kompress) is on — used to decide whether workers should preload the model.
+func (s CompressSettings) textEnabled() bool {
+	return s.CompressUserMessages || s.TargetRatio != nil
+}
+
 // settingsStore holds the current settings behind an atomic pointer (read once
 // per request, swapped on update) and persists them to disk so the service
 // starts up with the last state.
@@ -68,7 +74,7 @@ type settingsStore struct {
 	path string // "" disables persistence
 	log  *slog.Logger
 
-	saveMu sync.Mutex // serializes file writes
+	mu sync.Mutex // serializes writers (the full read-merge-validate-save-swap)
 }
 
 // loadSettings builds a store, seeding it from path if present and valid,
@@ -103,9 +109,36 @@ func loadSettings(path string, log *slog.Logger) *settingsStore {
 // get returns a snapshot of the current settings.
 func (st *settingsStore) get() CompressSettings { return *st.cur.Load() }
 
-// set validates, persists, then swaps in new settings. On a persistence error
-// the in-memory settings are left unchanged so disk and memory stay consistent.
+// set validates, persists, then swaps in a full settings value. On a
+// persistence error the in-memory settings are left unchanged so disk and
+// memory stay consistent.
 func (st *settingsStore) set(s CompressSettings) error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.applyLocked(s)
+}
+
+// merge applies a partial JSON update onto the current settings as one atomic
+// read-modify-write, so concurrent PUTs can't lose each other's changes.
+// Returns the resulting settings.
+func (st *settingsStore) merge(body []byte) (CompressSettings, error) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	merged := *st.cur.Load()
+	// Unmarshaling onto the current value leaves omitted fields untouched
+	// (partial update) and lets explicit null clear a pointer field.
+	if err := json.Unmarshal(body, &merged); err != nil {
+		return CompressSettings{}, err
+	}
+	if err := st.applyLocked(merged); err != nil {
+		return CompressSettings{}, err
+	}
+	return merged, nil
+}
+
+// applyLocked validates, persists, and swaps in s. The caller must hold st.mu.
+func (st *settingsStore) applyLocked(s CompressSettings) error {
 	if err := s.validate(); err != nil {
 		return err
 	}
@@ -116,14 +149,12 @@ func (st *settingsStore) set(s CompressSettings) error {
 	return nil
 }
 
-// save atomically writes settings to disk (temp file + rename).
+// save atomically writes settings to disk (temp file + rename). The caller must
+// hold st.mu.
 func (st *settingsStore) save(s CompressSettings) error {
 	if st.path == "" {
 		return nil
 	}
-	st.saveMu.Lock()
-	defer st.saveMu.Unlock()
-
 	b, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
@@ -137,7 +168,11 @@ func (st *settingsStore) save(s CompressSettings) error {
 	if err := os.WriteFile(tmp, append(b, '\n'), 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, st.path)
+	if err := os.Rename(tmp, st.path); err != nil {
+		_ = os.Remove(tmp) // don't leave a stale temp behind
+		return err
+	}
+	return nil
 }
 
 // configHandler serves the runtime tuning API: GET returns the current
@@ -161,19 +196,13 @@ func (h *configHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "read body failed", http.StatusBadRequest)
 			return
 		}
-		// Merge: unmarshal onto a copy of current settings so omitted fields
-		// keep their existing values (partial updates).
-		merged := h.store.get()
-		if err := json.Unmarshal(body, &merged); err != nil {
-			http.Error(w, fmt.Sprintf("invalid JSON: %v", err), http.StatusBadRequest)
-			return
-		}
-		if err := h.store.set(merged); err != nil {
+		updated, err := h.store.merge(body)
+		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		h.log.Info("config updated", "settings", merged)
-		writeJSON(w, http.StatusOK, h.store.get())
+		h.log.Info("config updated", "settings", updated)
+		writeJSON(w, http.StatusOK, updated)
 
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

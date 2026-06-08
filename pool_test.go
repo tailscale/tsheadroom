@@ -31,6 +31,13 @@ func TestHelperProcess(t *testing.T) {
 		w.Flush()
 	}
 
+	// Simulate a worker that never finishes starting up (e.g. a stuck model
+	// load): never emit ready, just block.
+	if os.Getenv("HELPER_NO_READY") == "1" {
+		time.Sleep(30 * time.Second)
+		os.Exit(0)
+	}
+
 	emit(map[string]any{"ready": true})
 
 	r := bufio.NewReader(os.Stdin)
@@ -59,6 +66,12 @@ func TestHelperProcess(t *testing.T) {
 		case "ERROR":
 			emit(responseEnvelope{ID: req.ID, OK: false, Error: "boom", ErrorType: "RuntimeError"})
 			continue
+		case "NIL_RESULT":
+			emit(responseEnvelope{ID: req.ID, OK: true, Result: nil}) // ok but no result
+			continue
+		case "WRONG_ID":
+			emit(responseEnvelope{ID: req.ID + 1, OK: true, Result: &compressResult{TokensSaved: 1}})
+			continue
 		}
 		emit(responseEnvelope{ID: req.ID, OK: true, Result: &compressResult{
 			Messages:          req.Payload.Messages,
@@ -72,11 +85,12 @@ func TestHelperProcess(t *testing.T) {
 }
 
 // helperCmd builds a worker command that re-executes this test binary as the
-// fake worker.
-func helperCmd() func() *exec.Cmd {
+// fake worker. extraEnv is appended to the child's environment.
+func helperCmd(extraEnv ...string) func() *exec.Cmd {
 	return func() *exec.Cmd {
 		cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcess")
 		cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1")
+		cmd.Env = append(cmd.Env, extraEnv...)
 		return cmd
 	}
 }
@@ -111,6 +125,33 @@ func TestPool_RoundTrip(t *testing.T) {
 	}
 	if len(res.Messages) != 2 {
 		t.Errorf("messages len = %d, want 2 (echoed)", len(res.Messages))
+	}
+}
+
+// A worker that reports ok:true but no result must not yield a nil result to
+// the caller (which would nil-deref the handler and break the always-200
+// guarantee); do() turns it into an error.
+func TestPool_NilResultIsError(t *testing.T) {
+	p := testPool(t, 1)
+	res, err := mustCompress(t, p, compressRequest{Model: "NIL_RESULT"}, 5*time.Second)
+	if err == nil || res != nil {
+		t.Fatalf("expected error and nil result, got res=%v err=%v", res, err)
+	}
+	// Pool recovers for the next request.
+	if _, err := mustCompress(t, p, compressRequest{Messages: []any{"x"}}, 5*time.Second); err != nil {
+		t.Fatalf("pool did not recover after nil-result: %v", err)
+	}
+}
+
+// A response whose id doesn't match the request means the stream desynced; do()
+// must reject it rather than return another request's result.
+func TestPool_IdMismatchIsError(t *testing.T) {
+	p := testPool(t, 1)
+	if _, err := mustCompress(t, p, compressRequest{Model: "WRONG_ID"}, 5*time.Second); err == nil {
+		t.Fatal("expected error on response id mismatch")
+	}
+	if _, err := mustCompress(t, p, compressRequest{Messages: []any{"x"}}, 5*time.Second); err != nil {
+		t.Fatalf("pool did not recover after id mismatch: %v", err)
 	}
 }
 
@@ -195,6 +236,36 @@ func TestPool_ConcurrentLoad(t *testing.T) {
 	close(errs)
 	for err := range errs {
 		t.Errorf("concurrent Compress failed: %v", err)
+	}
+}
+
+// A worker that never signals ready must fail startWorker promptly (not hang)
+// once the readiness timeout elapses, and return no worker handle (startWorker
+// kills+reaps the process internally before returning the error).
+func TestStartWorker_ReadyTimeout(t *testing.T) {
+	orig := workerReadyTimeout
+	workerReadyTimeout = 300 * time.Millisecond
+	defer func() { workerReadyTimeout = orig }()
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	done := make(chan struct{})
+	var w *worker
+	var err error
+	go func() {
+		w, err = startWorker(helperCmd("HELPER_NO_READY=1"), 0, log)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second): // >> 300ms timeout; proves it didn't hang
+		t.Fatal("startWorker hung past the readiness timeout")
+	}
+	if err == nil {
+		w.kill()
+		t.Fatal("expected startWorker to fail when the worker never readies")
+	}
+	if w != nil {
+		t.Errorf("expected nil worker on failure, got %+v", w)
 	}
 }
 

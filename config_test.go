@@ -147,6 +147,36 @@ func TestConfigHandler_GetPutMerge(t *testing.T) {
 	}
 }
 
+// target_ratio is a nullable pointer field; exercise set-to-value, preserve on
+// an unrelated partial PUT, and explicit set-back-to-null.
+func TestConfigHandler_NullableMerge(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	st := loadSettings(path, quietLog())
+	h := &configHandler{store: st, log: quietLog()}
+
+	if st.get().TargetRatio != nil {
+		t.Fatalf("default target_ratio should be null, got %v", *st.get().TargetRatio)
+	}
+
+	// Set it.
+	_, got := doConfig(t, h, http.MethodPut, `{"target_ratio": 0.3}`)
+	if got.TargetRatio == nil || *got.TargetRatio != 0.3 {
+		t.Fatalf("target_ratio not set: %+v", got.TargetRatio)
+	}
+
+	// An unrelated partial PUT must preserve it.
+	_, got = doConfig(t, h, http.MethodPut, `{"protect_recent": 2}`)
+	if got.TargetRatio == nil || *got.TargetRatio != 0.3 {
+		t.Errorf("unrelated PUT clobbered target_ratio: %+v", got.TargetRatio)
+	}
+
+	// Explicit null clears it.
+	_, got = doConfig(t, h, http.MethodPut, `{"target_ratio": null}`)
+	if got.TargetRatio != nil {
+		t.Errorf("explicit null did not clear target_ratio: %v", *got.TargetRatio)
+	}
+}
+
 func TestConfigHandler_PutInvalid(t *testing.T) {
 	st := loadSettings(filepath.Join(t.TempDir(), "config.json"), quietLog())
 	h := &configHandler{store: st, log: quietLog()}
