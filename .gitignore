@@ -1,0 +1,18 @@
+# Build output
+/build/
+
+# Test virtualenv (create locally; CI installs headroom-ai itself)
+/.venv-test/
+/.venv/
+
+# Python caches
+__pycache__/
+*.pyc
+
+# tsnet state — contains tailscaled.state (the node's private key). Never commit.
+# `t/` is the conventional local -state-dir; also guard the state files by name.
+/t/
+tailscaled.state
+tailscaled.log.conf
+tailscaled.log*.txt
+profile-data/
