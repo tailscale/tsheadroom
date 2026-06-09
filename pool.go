@@ -40,6 +40,7 @@ type compressResult struct {
 	// Diagnostics added by worker.py (not part of headroom's CompressResult).
 	ElapsedMs     float64 `json:"elapsed_ms"`      // worker-side compress() wall time
 	ColdFirstCall bool    `json:"cold_first_call"` // this worker's first real request
+	ModelLimit    int     `json:"model_limit"`     // context-window limit compressed against
 }
 
 // requestEnvelope / responseEnvelope are the NDJSON framing on the wire.

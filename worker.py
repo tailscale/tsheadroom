@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from typing import Any
@@ -93,6 +94,50 @@ _proto = sys.stdout
 # the cold call (the one that may pay the lazy model load) to the Go side.
 _served_a_request = False
 
+# Default context window when we can't resolve a model's real limit. Matches
+# compress()'s own default; correct for most current Claude models.
+_DEFAULT_MODEL_LIMIT = 200000
+
+# tsheadroom-side context-window overrides, consulted BEFORE Headroom's registry.
+# The bundled registry lists no current Claude 4.x model, so without these they
+# fall to _DEFAULT_MODEL_LIMIT (200K) — which silently over-compresses a model
+# whose real window is larger. Each entry is a precompiled case-insensitive regex
+# matched with re.search (unanchored), so it matches anywhere in the model string
+# and tolerates punctuation/prefix/suffix drift: r"claude-opus-?4.8" matches
+# claude-opus-4-8, claude-opus4-8, claude-opus-4-8[1m], claude-opus-4.8, and a
+# provider-qualified anthropic/claude-opus-4-8. Tighten a pattern if it would
+# over-match a same-family model with a different window.
+_MODEL_LIMIT_OVERRIDES: tuple[tuple[re.Pattern[str], int], ...] = (
+    (re.compile(r"claude-opus-?4.8", re.IGNORECASE), 1_000_000),
+)
+
+try:
+    from headroom.models.registry import ModelRegistry as _ModelRegistry
+except Exception:  # noqa: BLE001 - older headroom without the registry
+    _ModelRegistry = None
+
+
+def _context_limit(model: str) -> int:
+    """Resolve a model's context-window limit.
+
+    compress() drives its aggressiveness off context_pressure =
+    tokens_before / model_limit, but defaults model_limit to a flat 200000
+    regardless of `model`. So passing the real limit matters: a big-context
+    model (e.g. a 1M-token Gemini, or claude-opus-4-8) would otherwise be
+    over-compressed, and a smaller one under-compressed. Resolution order:
+    tsheadroom overrides (regex search) -> Headroom's registry -> the 200K
+    default (used for models neither source knows, which is correct for the
+    current 200K Claude models the registry doesn't list yet)."""
+    for pat, limit in _MODEL_LIMIT_OVERRIDES:
+        if pat.search(model):
+            return limit
+    if _ModelRegistry is not None:
+        try:
+            return int(_ModelRegistry.get_context_limit(model, default=_DEFAULT_MODEL_LIMIT))
+        except Exception:  # noqa: BLE001 - registry shape changed; fall back
+            pass
+    return _DEFAULT_MODEL_LIMIT
+
 
 def _result_to_dict(result: Any) -> dict[str, Any]:
     """Project a CompressResult onto the plain fields the Go side consumes."""
@@ -122,6 +167,14 @@ def _compress(payload: dict[str, Any]) -> dict[str, Any]:
     model = payload.get("model")
     if model:
         kwargs["model"] = model
+        # Resolve the real context window so compression aggressiveness is sized
+        # to the model, not compress()'s flat 200000 default. Don't override an
+        # explicit model_limit from config.
+        if "model_limit" not in kwargs:
+            kwargs["model_limit"] = _context_limit(model)
+    # 0 when neither config nor a model supplied one (compress() then uses its
+    # own default); surfaced on the -v line for visibility.
+    model_limit = int(kwargs.get("model_limit", 0))
 
     global _served_a_request
     cold_first_call = not _served_a_request
@@ -136,6 +189,7 @@ def _compress(payload: dict[str, Any]) -> dict[str, Any]:
     # first call that's also slow is the lazy ML-model-load case.
     out["elapsed_ms"] = round(elapsed_ms, 1)
     out["cold_first_call"] = cold_first_call
+    out["model_limit"] = model_limit
     return out
 
 

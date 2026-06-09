@@ -114,6 +114,43 @@ class WorkerLogicTest(unittest.TestCase):
         worker._compress({"messages": [{"role": "user"}], "config": "nope"})
         self.assertEqual(self.last_kwargs(), {})
 
+    def test_model_limit_override_regex_matches_variants(self):
+        # claude-opus-4-8 (1M context) is unknown to Headroom's registry, so the
+        # tsheadroom override supplies it. The override is a case-insensitive,
+        # unanchored regex (claude-opus-?4.8), so it covers dated/[1m]/punctuation
+        # variants, a provider-qualified prefix, and any case.
+        for model in (
+            "claude-opus-4-8",
+            "claude-opus-4-8-20251101",
+            "claude-opus-4-8[1m]",
+            "claude-opus4-8",  # optional dash after "opus"
+            "claude-opus-4.8",  # "." matches the dot too
+            "anthropic/claude-opus-4-8",  # unanchored: matches mid-string
+            "CLAUDE-OPUS-4-8",  # case-insensitive
+        ):
+            worker._compress({"messages": [{"role": "user"}], "model": model})
+            self.assertEqual(self.last_kwargs().get("model_limit"), 1_000_000, model)
+
+    def test_model_limit_override_does_not_overmatch(self):
+        # A different Opus generation must not trip the opus-4-8 override.
+        worker._compress({"messages": [{"role": "user"}], "model": "claude-opus-4-1-20250805"})
+        self.assertEqual(self.last_kwargs().get("model_limit"), worker._DEFAULT_MODEL_LIMIT)
+
+    def test_model_limit_defaults_when_unresolved(self):
+        # Registry is stubbed out in these tests, so an unlisted model with no
+        # override falls back to the 200K default.
+        worker._compress({"messages": [{"role": "user"}], "model": "some-unknown-model"})
+        self.assertEqual(self.last_kwargs().get("model_limit"), worker._DEFAULT_MODEL_LIMIT)
+
+    def test_explicit_config_model_limit_wins(self):
+        # An operator-set model_limit in config is never overridden by the lookup.
+        worker._compress({
+            "messages": [{"role": "user"}],
+            "model": "claude-opus-4-8",
+            "config": {"model_limit": 12345},
+        })
+        self.assertEqual(self.last_kwargs().get("model_limit"), 12345)
+
     def test_non_list_messages_raises(self):
         with self.assertRaises(ValueError):
             worker._compress({"messages": "not a list"})

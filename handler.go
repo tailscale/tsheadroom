@@ -56,9 +56,10 @@ type summary struct {
 	inBytes    int // serialized size of received messages
 	outBytes   int // serialized size of returned messages
 
-	workerMs float64 // worker-reported compress() time (0 when no worker result)
-	cold     bool    // worker's first real request (paid the cold model load)
-	reason   string  // why this action was chosen: modify / allow(noop|error|passthrough|read-error)
+	workerMs   float64 // worker-reported compress() time (0 when no worker result)
+	cold       bool    // worker's first real request (paid the cold model load)
+	modelLimit int     // context-window limit the worker compressed against (0 when no result)
+	reason     string  // why this action was chosen: modify / allow(noop|error|passthrough|read-error)
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -71,8 +72,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	resp, s := h.process(r)
 
 	if h.verbose {
-		fmt.Fprintf(h.out, "request in_msgs=%d in_bytes=%d out_bytes=%d dur_ms=%d worker_ms=%.0f cold=%t -> %s\n",
-			s.inMessages, s.inBytes, s.outBytes, time.Since(start).Milliseconds(), s.workerMs, s.cold, s.reason)
+		fmt.Fprintf(h.out, "request in_msgs=%d in_bytes=%d out_bytes=%d dur_ms=%d worker_ms=%.0f cold=%t model_limit=%d -> %s\n",
+			s.inMessages, s.inBytes, s.outBytes, time.Since(start).Milliseconds(), s.workerMs, s.cold, s.modelLimit, s.reason)
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -135,10 +136,11 @@ func (h *Handler) process(r *http.Request) (guardrailResponse, summary) {
 		s.reason = "allow(error)"
 		return allow, s
 	}
-	// Worker timing/cold are available for both noop and modify; record them so
-	// the -v line shows them regardless of the outcome.
+	// Worker timing/cold/limit are available for both noop and modify; record
+	// them so the -v line shows them regardless of the outcome.
 	s.workerMs = res.ElapsedMs
 	s.cold = res.ColdFirstCall
+	s.modelLimit = res.ModelLimit
 	if res.TokensSaved <= 0 {
 		// No-op: nothing meaningful to change, so don't rewrite the body.
 		s.reason = "allow(noop)"
