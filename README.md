@@ -6,7 +6,7 @@ Coding agents and RAG pipelines send the model the same bulky, low-value payload
 
 It runs [Headroom](https://github.com/chopratejas/headroom)'s `compress()` function, which crushes bulky content while leaving prompts, instructions, and recent turns intact. If there's nothing worth compressing (or anything goes wrong), the request passes through unchanged. tsheadroom can never block or break a request.
 
-If you already run Aperture, you already run a [Tailscale](https://tailscale.com/) tailnet. tsheadroom joins that tailnet as a device (using [`tsnet`](https://tailscale.com/kb/1244/tsnet)) and Aperture calls out to it. No public endpoint, no API keys: access is gated by your tailnet's [grants](https://tailscale.com/docs/features/access-control/grants).
+If you run Aperture, you already run a [Tailscale](https://tailscale.com/) tailnet. tsheadroom joins that tailnet as a device (using [`tsnet`](https://tailscale.com/kb/1244/tsnet)) and Aperture calls out to it. No public endpoint, no API keys: access is gated by your tailnet's [grants](https://tailscale.com/docs/features/access-control/grants).
 
 ## What you get
 
