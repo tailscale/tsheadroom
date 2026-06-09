@@ -13,7 +13,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 )
 
 // fakeCompressor lets each test dictate the pool's behavior.
@@ -29,7 +28,6 @@ func newTestHandler(fn func(ctx context.Context, req compressRequest) (*compress
 	return &Handler{
 		comp:     fakeCompressor{fn: fn},
 		settings: loadSettings("", quietLog()),
-		deadline: time.Second,
 		log:      quietLog(),
 		out:      io.Discard,
 	}

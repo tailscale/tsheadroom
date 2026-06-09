@@ -31,9 +31,8 @@ import (
 func main() {
 	var (
 		hostname    = flag.String("hostname", "tsheadroom", "tsnet hostname (how this node appears on the tailnet)")
-		poolSize    = flag.Int("pool-size", 4, "number of Python compression workers")
-		deadline    = flag.Duration("deadline", 4*time.Second, "per-request fail-open deadline (keep under aperture's hook timeout)")
-		maxCompress = flag.Duration("max-compress", 60*time.Second, "hard cap on a single worker call before it's recycled (must exceed -deadline; covers one-time model loads)")
+		poolSize    = flag.Int("pool-size", 8, "number of Python compression workers")
+		maxCompress = flag.Duration("max-compress", 60*time.Second, "hard cap on a single worker call before it's recycled (covers one-time model loads); the sole worker-side timeout")
 		python      = flag.String("python", "python3", "Python interpreter with headroom-ai installed")
 		script      = flag.String("worker", "worker.py", "path to worker.py")
 		addr        = flag.String("addr", ":80", "listen address on the tsnet node")
@@ -59,11 +58,6 @@ func main() {
 	}
 	settings := loadSettings(configPath, log)
 
-	if *maxCompress <= *deadline {
-		log.Warn("max-compress should exceed deadline; slow calls will be killed before the client's fail-open",
-			"max_compress", *maxCompress, "deadline", *deadline)
-	}
-
 	// Workers preload the ML model at startup when text compression is enabled;
 	// the decision lives here (single source of truth) and is re-evaluated at
 	// each spawn, so a worker respawned after a runtime change is up to date.
@@ -75,7 +69,6 @@ func main() {
 	handler := &Handler{
 		comp:     pool,
 		settings: settings,
-		deadline: *deadline,
 		log:      log,
 		verbose:  *verbose,
 		out:      os.Stdout,
@@ -104,7 +97,6 @@ func main() {
 		"hostname", *hostname,
 		"addr", listenAddr(*localAddr, *addr),
 		"pool_size", *poolSize,
-		"deadline", *deadline,
 		"max_compress", *maxCompress,
 		"python", *python,
 		"config", configPath,

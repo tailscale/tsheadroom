@@ -25,6 +25,29 @@ type hookCallData struct {
 
 // guardrailResponse is aperture's GuardrailResponse. We only ever emit "allow"
 // or "modify" — never "block" — and always with HTTP 200.
+//
+// Why never "block": Headroom's compress() is best-effort and has no "halt this
+// request" signal. It never raises on an over-limit conversation; it just
+// returns the most-compressed messages it can, even if they still exceed the
+// model's context window. So nothing compress() returns ever means "refuse" —
+// every compress error or shortfall collapses back to "allow" (forward the
+// original, unchanged). If a conversation is genuinely too big even after
+// compression, we forward it and the upstream provider returns its own native,
+// model-tailored "prompt is too long" error, which request/response clients
+// (Claude Code and friends) already recover from by auto-compacting and retrying.
+//
+// WHERE THIS WOULD BREAK — and why it can't today: the above assumes the client
+// recovers from the provider's overflow error. A streaming/WebSocket client of
+// the kind Headroom's own proxy deliberately fail-CLOSES for — one that decides
+// when to compact from the upstream-reported token usage that our compression
+// deflates, and that treats a mid-stream refuse (1009/413) as a fatal connection
+// error — could instead lock up when we fail open on an oversized frame. We
+// cannot hit that case: Aperture's hook protocol is request/response only (one
+// discrete HTTP POST per call; no WebSocket, no incremental frame delivery), so
+// no such client exists on this path. THERE ARE NONE TODAY. If Aperture ever
+// grows WebSocket/streaming hook support, revisit this: we may then need a real
+// "block" path that mimics the provider's overflow error shape so those clients
+// compact instead of hanging.
 type guardrailResponse struct {
 	Action      string `json:"action"`
 	RequestBody any    `json:"request_body,omitempty"`
@@ -43,8 +66,7 @@ type compressor interface {
 type Handler struct {
 	comp     compressor
 	settings *settingsStore // current compress knobs, read per request
-	deadline time.Duration
-	log      *slog.Logger // operational logs + warnings (stderr)
+	log      *slog.Logger   // operational logs + warnings (stderr)
 
 	verbose bool      // when set, emit a per-request summary to out
 	out     io.Writer // destination for verbose summaries (stdout)
@@ -123,10 +145,13 @@ func (h *Handler) process(r *http.Request) (guardrailResponse, summary) {
 		s.outBytes = s.inBytes
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), h.deadline)
-	defer cancel()
-
-	res, err := h.comp.Compress(ctx, compressRequest{
+	// No tsheadroom-side timeout: the wait is bounded by the request context
+	// (aperture hangs up at its hook timeout) and by the pool's hard cap (a
+	// runaway worker is recycled). A soft deadline here would only fail open
+	// *before* aperture would have — abandoning exactly the slow, large-context
+	// compressions this tool exists to perform. The latency ceiling belongs to
+	// aperture's per-hook `timeout`, which is owned by the caller.
+	res, err := h.comp.Compress(r.Context(), compressRequest{
 		Messages: messages,
 		Model:    model,
 		Config:   h.settings.get(),

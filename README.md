@@ -16,7 +16,7 @@ received by your Aperture instance and then forwarded to it, tsheadroom hands
 the request's `messages` array to Headroom's `compress()` function — which
 crushes bulky, low-information content (large tool outputs, search results,
 logs) while leaving prompts and recent turns intact — and returns a `modify`
-action with the compressed body. If there's nothing worthwhile to compress,or
+action with the compressed body. If there's nothing worthwhile to compress, or
 anything goes wrong, it returns `allow` and the request passes through
 unchanged. **It never blocks a request.**
 
@@ -95,14 +95,13 @@ wish to wrap tsheadroom in a `systemd` or similar service manager.
 | `-python` | `python3` | Interpreter with `headroom-ai` installed (used to launch workers). |
 | `-worker` | `worker.py` | Path to the worker script. |
 | `-hostname` | `tsheadroom` | Node name on the tailnet. |
-| `-pool-size` | `4` | Number of persistent Python workers. Each holds a resident copy of the ML model (~600MB) when text compression is active, so raise it deliberately. |
-| `-deadline` | `4s` | Per-request fail-open deadline (client-facing). Keep it under Aperture's hook `timeout`. |
-| `-max-compress` | `60s` | Hard cap on a single worker call before it's recycled. Must exceed `-deadline`; covers one-time ML model loads (see "Tuning compression"). |
+| `-pool-size` | `8` | Number of persistent Python workers. Each holds a resident copy of the ML model (~600MB) when text compression is active (~4.8GB at 8), so raise it deliberately. |
+| `-max-compress` | `60s` | Hard cap on a single worker call before the worker is recycled; the sole worker-side timeout. Covers one-time ML model loads (see "Tuning compression"). |
 | `-addr` | `:80` | Listen address on the tsnet node. |
 | `-state-dir` | tsnet default | tsnet state directory. **Persist this** — it holds the node identity (`tailscaled.state`). See note below. |
 | `-config` | `tsheadroom.config.json` | Path to the tunable compress-config file (see "Tuning compression"). Loaded at startup, rewritten on `PUT /config`. |
 | `-local-addr` | (off) | Serve plain HTTP here instead of tsnet — for local testing only. |
-| `-v` | off | Log a one-line per-request summary (`in/out` sizes, `modify`/`allow`) to stdout. |
+| `-v` | off | Log a one-line per-request summary (`in/out` sizes, timing, `model_limit`, `modify`/`allow`) to stdout. |
 
 `TS_AUTHKEY` (environment) provides the tailnet auth key on first start. You
 may harmlessly omit it for future restarts, once the state-dir has been
@@ -153,7 +152,7 @@ node:
   "headroom": {
     "url": "http://tsheadroom.<your-tailnet>.ts.net/",
     "fail_policy": "fail_open", // default; if tsheadroom is unreachable, send uncompressed
-    "timeout": "5s",            // must be >= tsheadroom's -deadline (4s)
+    "timeout": "30s",           // tsheadroom's only client-facing latency ceiling (see below)
   },
 },
 ```
@@ -186,9 +185,16 @@ Notes:
   (the model name is read from inside the body).
 - **`fail_open` is the right policy.** tsheadroom always answers `200` with
   `allow`/`modify` and never blocks; `fail_open` ensures that if the node is
-  *unreachable*, requests still proceed (just uncompressed).
-- Set the hook **`timeout` ≥ tsheadroom's `-deadline`** so tsheadroom's own
-  fail-open fires before Aperture times the call out.
+  *unreachable* — or a compression runs long — requests still proceed (just
+  uncompressed).
+- **The hook `timeout` is tsheadroom's only client-facing latency ceiling.**
+  tsheadroom has no soft timeout of its own: it waits for the compression and
+  returns, bounded only by this `timeout` (Aperture gives up and forwards the
+  original) and by its internal `-max-compress` worker cap. Set it to how long
+  you're willing to make a request wait for compression — `30s` matches
+  Headroom's own compression budget and comfortably fits large, late-session
+  requests. Lowering it just trades compression on the slowest requests for
+  latency; there's no separate tsheadroom knob to keep in sync.
 - Scope `models` to target specific providers, and use `preference` if you stack
   it with other guardrail hooks.
 
@@ -241,15 +247,22 @@ change config). Lock the node down accordingly, or restrict who can reach it.
 ### ML model loading and timeouts
 
 The ML text compressor loads a ~600MB model on first use (one-time, then cached
-on disk and resident in each worker). This load takes several seconds — longer
-than the `-deadline` — so tsheadroom handles it with two separate timeouts:
+on disk and resident in each worker). This load takes several seconds, and a
+large, late-session conversation can itself take a few seconds to compress. There
+is **one** timeout that bounds the worker, and the client-facing wait is owned by
+Aperture:
 
-- **`-deadline` (4s)** bounds the *client* response: if a call is still running,
-  tsheadroom fails open (`allow`) so Aperture is never held up.
-- **`-max-compress` (60s)** bounds the *worker*: the call keeps running in the
-  background past the deadline, so the model finishes loading and the worker
-  stays warm. Only a call exceeding the hard cap is treated as wedged and
-  recycled.
+- **`-max-compress` (60s)** bounds the *worker*: a single call may run this long
+  before the worker is treated as wedged and recycled. tsheadroom imposes no
+  shorter deadline of its own — a slow call runs to completion (the model
+  finishes loading, the worker stays warm) and the result is used if Aperture is
+  still waiting.
+- **Aperture's hook `timeout`** bounds the *client*: when it fires, Aperture
+  (with `fail_open`) forwards the original request uncompressed. This is the only
+  client-facing latency ceiling, and it belongs in the Aperture config — there is
+  no tsheadroom-side `-deadline` to keep in sync. Set it to your tolerance for
+  waiting on compression (`30s` recommended; it matches Headroom's own budget and
+  fits large requests).
 
 The result: a cold worker pays **at most one** uncompressed (`allow`) request
 while the model loads, then it works — **no restart needed**. To avoid even that,
