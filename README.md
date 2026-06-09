@@ -1,17 +1,24 @@
 # tsheadroom
 
-A [Headroom](https://pypi.org/project/headroom-ai/) context-compression layer
+A [Headroom](https://github.com/chopratejas/headroom) context-compression layer
 exposed as an [Aperture](https://github.com/tailscale/aperture) **`pre_request`
 guardrail hook**.
 
-tsheadroom runs as a node on your tailnet (via
-[`tsnet`](https://tailscale.com/kb/1244/tsnet)). For each LLM request Aperture
-forwards to it, tsheadroom hands the request's `messages` to Headroom's
-`compress()` — which crushes bulky, low-information content (large tool outputs,
-search results, logs) while leaving prompts and recent turns intact — and
-returns a `modify` action with the compressed body. If there's nothing
-worthwhile to compress, or anything goes wrong, it returns `allow` and the
-request passes through unchanged. **It never blocks a request.**
+You like Headroom, but you want it deployed for all LLM requests across your
+org, and you want it deployed transparently. *This* is the project for you.
+
+If you run Aperture, you already run a
+[Tailscale](https://tailscale.com/) tailnet.  tsheadroom runs as a node on your
+tailnet (via [`tsnet`](https://tailscale.com/kb/1244/tsnet)). You configure
+Aperture to call out to it as a `pre_request` hook, optionally scoping it to
+identities (users/groups/tags) and providers/models. For each LLM request
+received by your Aperture instance and then forwarded to it, tsheadroom hands
+the request's `messages` array to Headroom's `compress()` function — which
+crushes bulky, low-information content (large tool outputs, search results,
+logs) while leaving prompts and recent turns intact — and returns a `modify`
+action with the compressed body. If there's nothing worthwhile to compress,or
+anything goes wrong, it returns `allow` and the request passes through
+unchanged. **It never blocks a request.**
 
 ## How it works
 
@@ -25,10 +32,11 @@ Aperture --(pre_request hook: POST /)--> tsheadroom (tsnet :80)
                                                      or  {"action":"allow"}
 ```
 
-The Go binary owns a small pool of long-lived Python worker processes (so the
-Headroom pipeline is built once, not per request) and supervises them
-(auto-restart on crash, fail-open on timeout). All Headroom calls happen
-out-of-process, so a worker fault can never take down the listener.
+The tsheadroom Go binary owns a small pool of long-lived Python worker processes
+(so the Headroom pipeline is built once, not per request) and supervises them
+(auto-restart on crash, fail-open on timeout). Headroom calls happen
+out-of-process, allowing the Python `compress()` implementation to run with
+minimal overhead, and prevent faults from taking down the listener.
 
 ## a) Dependencies
 
@@ -77,6 +85,9 @@ This joins the tailnet as `tsheadroom` and listens for hook calls on `:80` at
 path `/`. Other tailnet nodes (including Aperture) reach it at
 `http://tsheadroom.<your-tailnet>.ts.net/`.
 
+For maximum durability or hosting in AWS or on other cloud instances, you may
+wish to wrap tsheadroom in a `systemd` or similar service manager.
+
 ### Flags
 
 | Flag | Default | Description |
@@ -93,7 +104,9 @@ path `/`. Other tailnet nodes (including Aperture) reach it at
 | `-local-addr` | (off) | Serve plain HTTP here instead of tsnet — for local testing only. |
 | `-v` | off | Log a one-line per-request summary (`in/out` sizes, `modify`/`allow`) to stdout. |
 
-`TS_AUTHKEY` (environment) provides the tailnet auth key on first start.
+`TS_AUTHKEY` (environment) provides the tailnet auth key on first start. You
+may harmlessly omit it for future restarts, once the state-dir has been
+populated.
 
 **State:** `-state-dir` must be a stable, writable, persistent path (e.g. a
 systemd `StateDirectory`). It contains `tailscaled.state`, the node's **private
@@ -178,6 +191,9 @@ Notes:
   fail-open fires before Aperture times the call out.
 - Scope `models` to target specific providers, and use `preference` if you stack
   it with other guardrail hooks.
+
+Further information about hook configuration is available in the official
+[Aperture documentation](https://tailscale.com/docs/aperture/configuration).
 
 ## Tuning compression (runtime config)
 
@@ -270,6 +286,15 @@ make test PYTHON=/opt/tsheadroom/venv/bin/python  # also runs the real-headroom 
 Go tests use a fake worker (no Python needed); Python tests use a fake
 `headroom` by default and run the real-headroom integration test only when
 `$PYTHON` has `headroom-ai` installed.
+
+## Bugs
+
+Please note that tsheadroom is not affiliated with
+[Headroom](https://github.com/chopratejas/headroom) and you should file bugs
+pertaining to the `compress()` function and issues there.  For bugs in
+tsheadroom, related to Aperture integration, incorrect request/response parsing,
+or errant program behavior, please file any issues on the
+[issue tracker](https://github.com/tailscale/tsheadroom/issues).
 
 ## Contributing
 
