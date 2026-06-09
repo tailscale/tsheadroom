@@ -269,13 +269,10 @@ type worker struct {
 // to the log, and blocks until the worker emits its {"ready":true} line.
 func startWorker(newCmd func() *exec.Cmd, slot int, log *slog.Logger) (*worker, error) {
 	cmd := newCmd()
-	// Pdeathsig: the kernel SIGKILLs the worker if we (the parent) die, so no
-	// orphans survive a supervisor crash. Setpgid: own process group, so we can
-	// signal the whole tree on shutdown.
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Pdeathsig: syscall.SIGKILL,
-		Setpgid:   true,
-	}
+	// Run the worker in its own process group (so we can signal the whole tree
+	// on shutdown) and, where the platform supports it, have the kernel kill it
+	// if we die. The details are platform-specific; see procattr_*.go.
+	setProcAttr(cmd)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
