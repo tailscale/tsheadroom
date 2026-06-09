@@ -95,7 +95,7 @@ wish to wrap tsheadroom in a `systemd` or similar service manager.
 | `-python` | `python3` | Interpreter with `headroom-ai` installed (used to launch workers). |
 | `-worker` | `worker.py` | Path to the worker script. |
 | `-hostname` | `tsheadroom` | Node name on the tailnet. |
-| `-pool-size` | `max(4, GOMAXPROCS)` | Number of persistent Python workers. |
+| `-pool-size` | `4` | Number of persistent Python workers. Each holds a resident copy of the ML model (~600MB) when text compression is active, so raise it deliberately. |
 | `-deadline` | `4s` | Per-request fail-open deadline (client-facing). Keep it under Aperture's hook `timeout`. |
 | `-max-compress` | `60s` | Hard cap on a single worker call before it's recycled. Must exceed `-deadline`; covers one-time ML model loads (see "Tuning compression"). |
 | `-addr` | `:80` | Listen address on the tsnet node. |
@@ -251,17 +251,27 @@ than the `-deadline` — so tsheadroom handles it with two separate timeouts:
   stays warm. Only a call exceeding the hard cap is treated as wedged and
   recycled.
 
-The result: enabling text compression at runtime via `PUT /config` costs **at
-most one** uncompressed (`allow`) request while the model loads, then it works —
-**no restart needed**. To avoid even that one, workers **preload** the model at
-startup whenever the persisted config has a text knob enabled (so new/restarted
-workers come up warm).
+The result: a cold worker pays **at most one** uncompressed (`allow`) request
+while the model loads, then it works — **no restart needed**. To avoid even that,
+workers **preload** the model at startup whenever the persisted config could
+route content through the ML compressor. With `headroom-ai[ml]` installed this is
+the **default**: `compress_system_messages` defaults on, and Headroom also uses
+the ML Kompress model as its fallback for tool/mixed content — so the model is
+needed for ordinary traffic even under an otherwise-default config, and workers
+come up warm. (Each preloaded worker holds its own resident copy of the model,
+which is why `-pool-size` defaults low — see the flag table.)
 
 The model is downloaded from HuggingFace on first ever use (cached under
-`~/.cache/huggingface` thereafter). A worker has ~60s to report ready, so a slow
-*cold* download on a fresh host can exceed that and make workers retry; warm the
-cache once (start with a text knob on, or run a single `compress` under the
-worker's interpreter) before serving production traffic.
+`~/.cache/huggingface` thereafter). transformers revalidates that cache against
+the HuggingFace Hub on each cold load; tsheadroom skips that network round-trip
+(and its anonymous rate-limiting) by running the workers **offline once the model
+is cached** (`HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE`, set automatically). To
+instead stay online with higher rate limits — e.g. to let a fresh host download
+the model — set **`HF_TOKEN`** in the environment; it is honored only when set,
+and takes precedence over the automatic offline mode. A worker has ~60s to report
+ready, so a slow *cold* download on a fresh host can exceed that and make workers
+retry; warm the cache once (start a worker with the cache empty, or run a single
+`compress` under the worker's interpreter) before serving production traffic.
 
 ## What actually gets compressed
 

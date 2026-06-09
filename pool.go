@@ -36,6 +36,10 @@ type compressResult struct {
 	TokensSaved       int      `json:"tokens_saved"`
 	CompressionRatio  float64  `json:"compression_ratio"`
 	TransformsApplied []string `json:"transforms_applied"`
+
+	// Diagnostics added by worker.py (not part of headroom's CompressResult).
+	ElapsedMs     float64 `json:"elapsed_ms"`      // worker-side compress() wall time
+	ColdFirstCall bool    `json:"cold_first_call"` // this worker's first real request
 }
 
 // requestEnvelope / responseEnvelope are the NDJSON framing on the wire.
@@ -56,6 +60,10 @@ const (
 	shutdownGrace  = 5 * time.Second
 	initialBackoff = 200 * time.Millisecond
 	maxBackoff     = 10 * time.Second
+	// slowCallLog is the worker-call duration above which we log a one-line
+	// notice at Info (visible without -v). It's meant to surface the one-time
+	// cold ML model load and any genuinely slow compress.
+	slowCallLog = 2 * time.Second
 )
 
 // workerReadyTimeout bounds how long startWorker waits for a worker's
@@ -151,6 +159,12 @@ func (p *Pool) Compress(ctx context.Context, req compressRequest) (*compressResu
 	case r := <-j.resp:
 		return r.result, r.err
 	case <-ctx.Done():
+		// The client's fail-open deadline fired while the worker is still
+		// running. We return now (the handler fails open and the request passes
+		// uncompressed), but the worker keeps going under the hard cap and stays
+		// warm for the next call. Log it so this "passthrough while warming"
+		// case — most likely on a cold worker's first large request — is visible.
+		p.log.Warn("client deadline elapsed before worker finished; failing open (worker continues, warming)", "err", ctx.Err())
 		return nil, ctx.Err()
 	}
 }
@@ -189,13 +203,20 @@ func (p *Pool) runSlot(idx int) {
 			// and leaves the worker warm. Only a real error or the hard cap
 			// (genuinely wedged) recycles the worker. j.resp is buffered, so the
 			// send never blocks even after the client has given up.
+			start := time.Now()
 			hardCtx, cancel := context.WithTimeout(p.ctx, p.maxCompress)
 			res, err := w.do(hardCtx, j.req)
 			cancel()
+			dur := time.Since(start)
 			if err != nil {
-				p.log.Warn("worker request failed; recycling", "slot", idx, "err", err)
+				p.log.Warn("worker request failed; recycling", "slot", idx, "dur", dur, "err", err)
 				w.kill()
 				w = p.spawn(idx)
+			} else if dur >= slowCallLog {
+				// Surface slow calls without requiring -v; cold_first_call
+				// pinpoints the one-time ML model load.
+				p.log.Info("slow worker call", "slot", idx, "dur", dur,
+					"cold_first_call", res.ColdFirstCall, "worker_ms", res.ElapsedMs)
 			}
 			j.resp <- jobResult{result: res, err: err}
 		}

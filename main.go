@@ -22,7 +22,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"syscall"
 	"time"
 
@@ -32,7 +31,7 @@ import (
 func main() {
 	var (
 		hostname    = flag.String("hostname", "tsheadroom", "tsnet hostname (how this node appears on the tailnet)")
-		poolSize    = flag.Int("pool-size", max(4, runtime.GOMAXPROCS(0)), "number of Python compression workers")
+		poolSize    = flag.Int("pool-size", 4, "number of Python compression workers")
 		deadline    = flag.Duration("deadline", 4*time.Second, "per-request fail-open deadline (keep under aperture's hook timeout)")
 		maxCompress = flag.Duration("max-compress", 60*time.Second, "hard cap on a single worker call before it's recycled (must exceed -deadline; covers one-time model loads)")
 		python      = flag.String("python", "python3", "Python interpreter with headroom-ai installed")

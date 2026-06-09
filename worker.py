@@ -38,14 +38,60 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from typing import Any
 
-from headroom import compress
+# Kompress (the ML text compressor) loads ModernBERT via transformers'
+# from_pretrained(), which — without local_files_only — revalidates the cache
+# against the HuggingFace Hub on every cold load. That network round-trip shows
+# up as "unauthenticated requests to the HF Hub", adds latency to the first
+# request a worker serves, and risks anonymous rate-limiting across a pool. We
+# tame it *before* importing headroom (so transformers sees the env at import).
+_KOMPRESS_REPOS = ("answerdotai/ModernBERT-base", "chopratejas/kompress-base")
+
+
+def _models_cached() -> bool:
+    """True if the Kompress models are already in the local HF cache, so it's
+    safe to run transformers offline (no network needed to load them)."""
+    try:
+        from huggingface_hub import scan_cache_dir
+
+        repos = {r.repo_id for r in scan_cache_dir().repos}
+    except Exception:  # noqa: BLE001 - hub missing/unscannable -> assume not cached
+        return False
+    return set(_KOMPRESS_REPOS).issubset(repos)
+
+
+def _configure_hf_env() -> None:
+    """Avoid a per-cold-load HF Hub round-trip on the model-load path.
+
+    - If HF_TOKEN is set, stay online: the token raises rate limits and lets a
+      fresh host download the model. We change nothing else.
+    - Otherwise, if the models are already cached locally, force offline mode so
+      from_pretrained never touches the network. If they're not cached yet
+      (fresh host, no token), stay online so the first download can happen.
+
+    Operator-set HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE are respected (setdefault).
+    """
+    if os.environ.get("HF_TOKEN"):
+        return
+    if _models_cached():
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+
+_configure_hf_env()
+
+from headroom import compress  # noqa: E402 - must follow _configure_hf_env()
 
 # The protocol stream. main() repoints this at a private dup of the original
 # stdout and redirects fd 1 to stderr, so library output (HF/transformers/torch
 # progress, stray prints) can never corrupt the NDJSON the Go parent reads.
 _proto = sys.stdout
+
+# Flips to True after this worker serves its first real request, so we can flag
+# the cold call (the one that may pay the lazy model load) to the Go side.
+_served_a_request = False
 
 
 def _result_to_dict(result: Any) -> dict[str, Any]:
@@ -77,8 +123,20 @@ def _compress(payload: dict[str, Any]) -> dict[str, Any]:
     if model:
         kwargs["model"] = model
 
+    global _served_a_request
+    cold_first_call = not _served_a_request
+    _served_a_request = True
+
+    t0 = time.monotonic()
     result = compress(messages, **kwargs)
-    return _result_to_dict(result)
+    elapsed_ms = (time.monotonic() - t0) * 1000.0
+
+    out = _result_to_dict(result)
+    # Diagnostics for the Go side (handler -v line / pool slow-call log). A cold
+    # first call that's also slow is the lazy ML-model-load case.
+    out["elapsed_ms"] = round(elapsed_ms, 1)
+    out["cold_first_call"] = cold_first_call
+    return out
 
 
 def _emit(obj: dict[str, Any]) -> None:
@@ -99,16 +157,20 @@ def _warmup() -> None:
 
     Always builds the (lazy) pipeline. When preload is requested, also runs a
     sizable user-message compress to force the ML model (Kompress) to load now —
-    otherwise that multi-second load would land on the first real request.
-    Best-effort: failures here never block serving."""
+    otherwise that multi-second load would land on the first real request. The
+    load time is logged (to stderr, which the Go parent captures) so cold-start
+    cost is visible. Best-effort: failures here never block serving."""
     try:
         if _preload_requested():
+            t0 = time.monotonic()
             big = "The system processes the request and returns a response. " * 80
             compress([{"role": "user", "content": big}], compress_user_messages=True)
+            dt = time.monotonic() - t0
+            print(f"tsheadroom: ML model preload complete in {dt:.1f}s", file=sys.stderr, flush=True)
         else:
             compress([{"role": "user", "content": "warmup"}])
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001 - warmup is best-effort
+        print(f"tsheadroom: warmup failed ({type(e).__name__}): {e}", file=sys.stderr, flush=True)
 
 
 def main() -> int:

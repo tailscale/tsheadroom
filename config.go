@@ -70,8 +70,14 @@ func (s CompressSettings) validate() error {
 // preload that model at startup (passed to them via TSHEADROOM_PRELOAD; see
 // worker.py's _warmup). Keep this in sync with any new ML-driving knob added to
 // CompressSettings.
+//
+// CompressSystemMessages defaults to true, so with headroom-ai[ml] installed the
+// ML model is needed for ordinary traffic even under an otherwise-default config
+// (and headroom also uses Kompress as its fallback for tool/mixed content). We
+// therefore include it here, which makes preload on by default — workers come up
+// warm instead of cold-loading the ~600MB model on their first live request.
 func (s CompressSettings) textEnabled() bool {
-	return s.CompressUserMessages || s.TargetRatio != nil
+	return s.CompressUserMessages || s.CompressSystemMessages || s.TargetRatio != nil
 }
 
 // settingsStore holds the current settings behind an atomic pointer (read once

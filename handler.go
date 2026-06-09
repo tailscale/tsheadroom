@@ -55,6 +55,10 @@ type summary struct {
 	inMessages int // number of messages received
 	inBytes    int // serialized size of received messages
 	outBytes   int // serialized size of returned messages
+
+	workerMs float64 // worker-reported compress() time (0 when no worker result)
+	cold     bool    // worker's first real request (paid the cold model load)
+	reason   string  // why this action was chosen: modify / allow(noop|error|passthrough|read-error)
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -63,11 +67,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	start := time.Now()
 	resp, s := h.process(r)
 
 	if h.verbose {
-		fmt.Fprintf(h.out, "request in_msgs=%d in_bytes=%d out_bytes=%d -> %s\n",
-			s.inMessages, s.inBytes, s.outBytes, resp.Action)
+		fmt.Fprintf(h.out, "request in_msgs=%d in_bytes=%d out_bytes=%d dur_ms=%d worker_ms=%.0f cold=%t -> %s\n",
+			s.inMessages, s.inBytes, s.outBytes, time.Since(start).Milliseconds(), s.workerMs, s.cold, s.reason)
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -81,30 +86,30 @@ func (h *Handler) process(r *http.Request) (guardrailResponse, summary) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody))
 	if err != nil {
 		h.log.Warn("read request body failed; allowing", "err", err)
-		return allow, summary{}
+		return allow, summary{reason: "allow(read-error)"}
 	}
 
 	var data hookCallData
 	if err := json.Unmarshal(body, &data); err != nil || len(data.RequestBody) == 0 {
-		return allow, summary{}
+		return allow, summary{reason: "allow(passthrough)"}
 	}
 
 	// request_body must be a JSON object so we can splice messages back and
 	// return the whole thing (aperture rejects non-object modified bodies).
 	var reqBody map[string]any
 	if err := json.Unmarshal(data.RequestBody, &reqBody); err != nil {
-		return allow, summary{}
+		return allow, summary{reason: "allow(passthrough)"}
 	}
 
 	// v1 handles only the `messages` shape (Anthropic/OpenAI). Anything else
 	// (e.g. Gemini's `contents`, embeddings) passes through untouched.
 	rawMessages, ok := reqBody["messages"]
 	if !ok {
-		return allow, summary{}
+		return allow, summary{reason: "allow(passthrough)"}
 	}
 	messages, ok := rawMessages.([]any)
 	if !ok {
-		return allow, summary{}
+		return allow, summary{reason: "allow(passthrough)"}
 	}
 	model, _ := reqBody["model"].(string) // absent/non-string -> worker default
 
@@ -127,10 +132,16 @@ func (h *Handler) process(r *http.Request) (guardrailResponse, summary) {
 	})
 	if err != nil {
 		h.log.Warn("compress failed; allowing", "err", err)
+		s.reason = "allow(error)"
 		return allow, s
 	}
+	// Worker timing/cold are available for both noop and modify; record them so
+	// the -v line shows them regardless of the outcome.
+	s.workerMs = res.ElapsedMs
+	s.cold = res.ColdFirstCall
 	if res.TokensSaved <= 0 {
 		// No-op: nothing meaningful to change, so don't rewrite the body.
+		s.reason = "allow(noop)"
 		return allow, s
 	}
 
@@ -141,6 +152,7 @@ func (h *Handler) process(r *http.Request) (guardrailResponse, summary) {
 	if h.verbose {
 		s.outBytes = jsonLen(res.Messages)
 	}
+	s.reason = "modify"
 	return guardrailResponse{Action: "modify", RequestBody: reqBody}, s
 }
 
