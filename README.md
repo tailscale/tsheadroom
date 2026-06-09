@@ -56,9 +56,9 @@ For each request Aperture forwards, tsheadroom hands the `messages` array to `co
 
 **On the host that runs tsheadroom:**
 
-- **Linux.** tsheadroom is a long-lived server daemon and is built and run on Linux. *(The current build does not compile on macOS/Windows. It uses a Linux-only process attribute, so build for Linux, or cross-compile with `GOOS=linux`.)*
+- **Linux**, for the cloud hosts this is meant to run on. The binary also builds and runs on macOS, which is convenient for local development and testing.
 - **Go 1.26.4+** to build the binary (required by the pinned Tailscale dependency).
-- **Python 3.9–3.13** with `headroom-ai` installed. Python 3.14 is not yet supported: `headroom-ai` has no 3.14 wheel and falls back to a Rust build that fails. Use a 3.13-or-earlier interpreter.
+- **Python with `headroom-ai` installed.** Use a version `headroom-ai` ships a prebuilt wheel for — Python 3.10–3.13 as of this writing. The newest Python release often has no wheel yet (3.14 at the time of writing), and pip then falls back to a Rust source build that fails. If unsure which versions are covered, check `Requires: Python` and the wheel filenames on [headroom-ai's PyPI page](https://pypi.org/project/headroom-ai/).
 - **A Tailscale [auth key](https://tailscale.com/docs/features/access-control/auth-keys)** (`TS_AUTHKEY`) so the device can join your tailnet unattended. Generate one in the Tailscale admin console under **Settings** > **Keys**.
 
 ### Choose tool-output or text compression
@@ -90,9 +90,12 @@ GOOS=linux GOARCH=amd64 go build -o build/tsheadroom .   # or GOARCH=arm64
 Set up the Python interpreter (a virtualenv is recommended). `headroom-ai` ships prebuilt wheels on supported Python versions, so no Rust toolchain is needed:
 
 ```shell
-python3 -m venv /opt/tsheadroom/venv
+python3.13 -m venv /opt/tsheadroom/venv                   # a supported version, called explicitly (3.13 shown)
+/opt/tsheadroom/venv/bin/python --version                 # confirm it matches a version with a wheel
 /opt/tsheadroom/venv/bin/pip install 'headroom-ai[ml]'    # or just 'headroom-ai' for tool-output only
 ```
+
+Name the interpreter explicitly (`python3.13`, or whichever supported version you have) rather than using bare `python3`, which may resolve to a release too new to have a wheel — common on an up-to-date Homebrew or a pyenv default. A venv on an unsupported version makes the `pip install` fail trying to build `headroom-ai` from Rust source (see [Troubleshooting](#install-fails-building-headroom-ai)). If you do not have a supported interpreter, install one with `brew install python@3.13`, `pyenv install 3.13`, or your platform's package manager — substituting the version number for whatever `headroom-ai` currently ships wheels for.
 
 Copy the worker script next to wherever you'll run the service:
 
@@ -101,6 +104,25 @@ cp worker.py /opt/tsheadroom/worker.py
 ```
 
 You now have the three things tsheadroom needs at runtime: the binary, a Python interpreter with `headroom-ai`, and `worker.py`.
+
+### Install fails building headroom-ai
+
+If `pip install 'headroom-ai[ml]'` fails with `maturin failed` and an error like:
+
+```
+error: the configured Python interpreter version (3.14) is newer than PyO3's maximum supported version (3.13)
+```
+
+your virtualenv is on a Python release newer than `headroom-ai`'s latest published wheel (the exact versions in the message will change over time). With no matching wheel, pip tries to compile `headroom-ai` from Rust source and PyO3 rejects the build. Confirm the version with `/opt/tsheadroom/venv/bin/python --version`. To fix it, delete the venv and recreate it with a supported interpreter (3.13 shown here — use whatever [headroom-ai](https://pypi.org/project/headroom-ai/) currently ships a wheel for):
+
+```shell
+rm -rf /opt/tsheadroom/venv
+python3.13 -m venv /opt/tsheadroom/venv
+/opt/tsheadroom/venv/bin/python --version                 # confirm a supported version
+/opt/tsheadroom/venv/bin/pip install 'headroom-ai[ml]'
+```
+
+A correct install downloads prebuilt `.whl` files (their names contain the Python tag, e.g. `cp313`); if you instead see `Building wheel for headroom-ai` or `maturin`, you are still on an unsupported Python version.
 
 ## Run
 
