@@ -36,6 +36,11 @@ type compressResult struct {
 	TokensSaved       int      `json:"tokens_saved"`
 	CompressionRatio  float64  `json:"compression_ratio"`
 	TransformsApplied []string `json:"transforms_applied"`
+
+	// Diagnostics added by worker.py (not part of headroom's CompressResult).
+	ElapsedMs     float64 `json:"elapsed_ms"`      // worker-side compress() wall time
+	ColdFirstCall bool    `json:"cold_first_call"` // this worker's first real request
+	ModelLimit    int     `json:"model_limit"`     // context-window limit compressed against
 }
 
 // requestEnvelope / responseEnvelope are the NDJSON framing on the wire.
@@ -56,6 +61,10 @@ const (
 	shutdownGrace  = 5 * time.Second
 	initialBackoff = 200 * time.Millisecond
 	maxBackoff     = 10 * time.Second
+	// slowCallLog is the worker-call duration above which we log a one-line
+	// notice at Info (visible without -v). It's meant to surface the one-time
+	// cold ML model load and any genuinely slow compress.
+	slowCallLog = 2 * time.Second
 )
 
 // workerReadyTimeout bounds how long startWorker waits for a worker's
@@ -64,8 +73,9 @@ const (
 var workerReadyTimeout = 60 * time.Second
 
 // job is one unit of work handed to a slot goroutine. It carries no context:
-// the client's fail-open deadline is enforced by Compress's own select, while
-// the worker runs under the pool's hard cap (see runSlot).
+// the caller's request context (cancelled when aperture's hook timeout fires or
+// the client disconnects) is enforced by Compress's own select, while the worker
+// runs under the pool's hard cap (see runSlot).
 type job struct {
 	req  compressRequest
 	resp chan jobResult
@@ -132,12 +142,13 @@ func newPool(size int, newCmd func() *exec.Cmd, maxCompress time.Duration, log *
 	return p
 }
 
-// Compress submits a job and waits for the result, bounded by ctx (the client's
-// fail-open deadline). If ctx fires — while waiting for a free slot or while the
-// worker is still running — the caller gets an error and fails open, but the
-// worker keeps running under the pool's hard cap (see runSlot). That lets a slow
-// first call (e.g. a one-time model load) finish and leave the worker warm, so
-// the next call succeeds — no restart needed.
+// Compress submits a job and waits for the result, bounded by ctx (the request
+// context — cancelled when aperture's hook timeout fires or the client
+// disconnects; tsheadroom sets no deadline of its own). If ctx fires — while
+// waiting for a free slot or while the worker is still running — the caller gets
+// an error and fails open, but the worker keeps running under the pool's hard cap
+// (see runSlot). That lets a slow first call (e.g. a one-time model load) finish
+// and leave the worker warm, so the next call succeeds — no restart needed.
 func (p *Pool) Compress(ctx context.Context, req compressRequest) (*compressResult, error) {
 	j := job{req: req, resp: make(chan jobResult, 1)}
 	select {
@@ -151,6 +162,13 @@ func (p *Pool) Compress(ctx context.Context, req compressRequest) (*compressResu
 	case r := <-j.resp:
 		return r.result, r.err
 	case <-ctx.Done():
+		// The request context was cancelled (aperture's hook timeout fired, or
+		// the client went away) while the worker is still running. We return now
+		// (the handler fails open and the request passes uncompressed), but the
+		// worker keeps going under the hard cap and stays warm for the next call.
+		// Log it so this "passthrough while warming" case — most likely on a cold
+		// worker's first large request — is visible.
+		p.log.Warn("request canceled before worker finished; failing open (worker continues, warming)", "err", ctx.Err())
 		return nil, ctx.Err()
 	}
 }
@@ -183,19 +201,26 @@ func (p *Pool) runSlot(idx int) {
 					return // spawn only returns nil on pool shutdown
 				}
 			}
-			// Run under the pool's hard cap, NOT the client's deadline. The
-			// client already fails open on its own ctx in Compress; here we let
-			// the worker keep going so a slow call (e.g. a model load) finishes
+			// Run under the pool's hard cap, NOT the request context. Compress
+			// already fails open on that ctx; here we let the worker keep going
+			// so a slow call (e.g. a model load) finishes
 			// and leaves the worker warm. Only a real error or the hard cap
 			// (genuinely wedged) recycles the worker. j.resp is buffered, so the
 			// send never blocks even after the client has given up.
+			start := time.Now()
 			hardCtx, cancel := context.WithTimeout(p.ctx, p.maxCompress)
 			res, err := w.do(hardCtx, j.req)
 			cancel()
+			dur := time.Since(start)
 			if err != nil {
-				p.log.Warn("worker request failed; recycling", "slot", idx, "err", err)
+				p.log.Warn("worker request failed; recycling", "slot", idx, "dur", dur, "err", err)
 				w.kill()
 				w = p.spawn(idx)
+			} else if dur >= slowCallLog {
+				// Surface slow calls without requiring -v; cold_first_call
+				// pinpoints the one-time ML model load.
+				p.log.Info("slow worker call", "slot", idx, "dur", dur,
+					"cold_first_call", res.ColdFirstCall, "worker_ms", res.ElapsedMs)
 			}
 			j.resp <- jobResult{result: res, err: err}
 		}
