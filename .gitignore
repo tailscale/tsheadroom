@@ -23,3 +23,7 @@ tailscaled.state
 tailscaled.log.conf
 tailscaled.log*.txt
 profile-data/
+
+# vim
+.sw?
+*.sw?
