@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -29,9 +28,9 @@ func (f fakeCompressor) Compress(ctx context.Context, req compressRequest) (*com
 func newTestHandler(fn func(ctx context.Context, req compressRequest) (*compressResult, error)) *Handler {
 	return &Handler{
 		comp:     fakeCompressor{fn: fn},
-		settings: loadSettings("", slog.New(slog.NewTextHandler(io.Discard, nil))),
+		settings: loadSettings("", quietLog()),
 		deadline: time.Second,
-		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		log:      quietLog(),
 		out:      io.Discard,
 	}
 }

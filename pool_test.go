@@ -8,8 +8,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
-	"log/slog"
 	"os"
 	"os/exec"
 	"sync"
@@ -105,7 +103,7 @@ func testPool(t *testing.T, size int) *Pool {
 
 func testPoolCap(t *testing.T, size int, maxCompress time.Duration) *Pool {
 	t.Helper()
-	p := newPool(size, helperCmd(), maxCompress, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	p := newPool(size, helperCmd(), maxCompress, quietLog())
 	t.Cleanup(p.Shutdown)
 	return p
 }
@@ -250,7 +248,7 @@ func TestStartWorker_ReadyTimeout(t *testing.T) {
 	workerReadyTimeout = 300 * time.Millisecond
 	defer func() { workerReadyTimeout = orig }()
 
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	log := quietLog()
 	done := make(chan struct{})
 	var w *worker
 	var err error
@@ -273,7 +271,7 @@ func TestStartWorker_ReadyTimeout(t *testing.T) {
 }
 
 func TestPool_ShutdownIsPrompt(t *testing.T) {
-	p := newPool(2, helperCmd(), 30*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	p := newPool(2, helperCmd(), 30*time.Second, quietLog())
 	if _, err := mustCompress(t, p, compressRequest{Messages: []any{"x"}}, 5*time.Second); err != nil {
 		t.Fatalf("warmup compress: %v", err)
 	}

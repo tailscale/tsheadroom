@@ -4,8 +4,6 @@
 package main
 
 import (
-	"io"
-	"log/slog"
 	"net/http"
 	"testing"
 )
@@ -13,8 +11,7 @@ import (
 // listen's local path should return a working plain-HTTP listener and a cleanup
 // that closes it.
 func TestListen_LocalAddr(t *testing.T) {
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	ln, cleanup, err := listen("127.0.0.1:0", ":80", "ignored", "", log)
+	ln, cleanup, err := listen("127.0.0.1:0", ":80", "ignored", "", quietLog())
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}

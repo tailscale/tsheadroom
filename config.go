@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+
+	"tailscale.com/atomicfile"
 )
 
 // CompressSettings are the runtime-tunable knobs forwarded to headroom.compress.
@@ -64,7 +66,10 @@ func (s CompressSettings) validate() error {
 }
 
 // textEnabled reports whether a knob that drives the ML text compressor
-// (Kompress) is on — used to decide whether workers should preload the model.
+// (Kompress) is on. It's the single source of truth for whether workers should
+// preload that model at startup (passed to them via TSHEADROOM_PRELOAD; see
+// worker.py's _warmup). Keep this in sync with any new ML-driving knob added to
+// CompressSettings.
 func (s CompressSettings) textEnabled() bool {
 	return s.CompressUserMessages || s.TargetRatio != nil
 }
@@ -152,8 +157,7 @@ func (st *settingsStore) applyLocked(s CompressSettings) error {
 	return nil
 }
 
-// save atomically writes settings to disk (temp file + rename). The caller must
-// hold st.mu.
+// save atomically writes settings to disk. The caller must hold st.mu.
 func (st *settingsStore) save(s CompressSettings) error {
 	if st.path == "" {
 		return nil
@@ -167,15 +171,9 @@ func (st *settingsStore) save(s CompressSettings) error {
 			return err
 		}
 	}
-	tmp := st.path + ".tmp"
-	if err := os.WriteFile(tmp, append(b, '\n'), 0o644); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, st.path); err != nil {
-		_ = os.Remove(tmp) // don't leave a stale temp behind
-		return err
-	}
-	return nil
+	// atomicfile.WriteFile writes to a unique temp file in the same dir, fsyncs,
+	// and renames into place (cleaning up the temp on error).
+	return atomicfile.WriteFile(st.path, append(b, '\n'), 0o644)
 }
 
 // configHandler serves the runtime tuning API: GET returns the current
