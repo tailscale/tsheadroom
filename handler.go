@@ -36,15 +36,15 @@ type hookCallData struct {
 // model-tailored "prompt is too long" error, which request/response clients
 // (Claude Code and friends) already recover from by auto-compacting and retrying.
 //
-// WHERE THIS WOULD BREAK — and why it can't today: the above assumes the client
+// Where this would break, and why it can't today: the above assumes the client
 // recovers from the provider's overflow error. A streaming/WebSocket client of
-// the kind Headroom's own proxy deliberately fail-CLOSES for — one that decides
+// the kind Headroom's own proxy deliberately fail-closes for — one that decides
 // when to compact from the upstream-reported token usage that our compression
 // deflates, and that treats a mid-stream refuse (1009/413) as a fatal connection
 // error — could instead lock up when we fail open on an oversized frame. We
 // cannot hit that case: Aperture's hook protocol is request/response only (one
 // discrete HTTP POST per call; no WebSocket, no incremental frame delivery), so
-// no such client exists on this path. THERE ARE NONE TODAY. If Aperture ever
+// no such client exists on this path. If Aperture ever
 // grows WebSocket/streaming hook support, revisit this: we may then need a real
 // "block" path that mimics the provider's overflow error shape so those clients
 // compact instead of hanging.
