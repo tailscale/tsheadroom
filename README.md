@@ -386,6 +386,40 @@ Tunable parameters (these mirror Headroom's `CompressConfig`):
 
 > **Access**: the `/config` endpoint is gated only by your [tailnet policy file](https://tailscale.com/docs/reference/syntax/policy-file): anyone who can reach the device can read and change its configuration. Lock the device down accordingly (see [Security](#security-and-data-handling)).
 
+## Metrics (`/metrics`)
+
+tsheadroom exposes a Prometheus endpoint at `GET /metrics` on the same device. It uses the standard text exposition format, so any existing scraper works:
+
+```sh
+curl -s http://tsheadroom.<your-tailnet>.ts.net/metrics
+```
+
+Two families are emitted. The `headroom_*` metrics reuse the names Headroom's own proxy emits, so if you already scrape a Headroom proxy you can point the same dashboards at this endpoint:
+
+| metric | type | meaning |
+|---|---|---|
+| `headroom_requests_total` | counter | Compression hook calls processed. |
+| `headroom_requests_failed_total` | counter | Calls where compression errored and we failed open. |
+| `headroom_tokens_input_total` | counter | Input tokens seen (`tokens_before`). |
+| `headroom_tokens_saved_total` | counter | Tokens saved by compression (`tokens_saved`). |
+| `headroom_overhead_ms_{sum,count,min,max}` | counter/gauge | tsheadroom processing time per request, in ms (excludes the upstream LLM — that's what Headroom calls "overhead"). |
+| `headroom_requests_by_provider{provider}` | counter | Requests per provider (from Aperture metadata). |
+| `headroom_requests_by_model{model}` | counter | Requests per model (from Aperture metadata). |
+| `headroom_inbound_requests_total` / `_completed_total` / `_active` | counter/gauge | Inbound HTTP requests to the hook handler; `_active` is the live in-flight count. |
+
+The `tsheadroom_*` metrics have no Headroom analog and describe this service specifically:
+
+| metric | type | meaning |
+|---|---|---|
+| `tsheadroom_pool_slots_total` / `tsheadroom_pool_slots_busy` | gauge | Worker-pool size and how many slots are compressing right now. When `busy` sits at `total`, the pool is saturated and new requests queue (see [ML model loading and timeouts](#ml-model-loading-and-timeouts)). |
+| `tsheadroom_requests_by_outcome{outcome}` | counter | Requests by outcome: `modify`, `noop`, `error`, `passthrough`, `read_error`. |
+| `tsheadroom_cold_starts_total` | counter | Worker first-real-call events that paid the one-time ML model load. |
+| `tsheadroom_tokens_after_total` | counter | Output tokens after compression (`tokens_after`), so you can compute the realized ratio. |
+
+> **Why a subset?** tsheadroom is a `pre_request` hook, not a proxy: it runs `headroom.compress()` and never sees the upstream response. So Headroom proxy metrics that depend on the response or on prompt caching — completion tokens, TTFB, end-to-end latency, cache reads/writes and busts, per-transform timing, waste signals — have no source here and are deliberately omitted rather than reported as misleading zeros.
+
+> **Access**: like `/config`, `/metrics` is gated only by your tailnet policy file. Anyone who can reach the device can read it; it exposes aggregate counts and model/provider names, not request contents.
+
 ### ML model loading and timeouts
 
 The ML text compressor loads a ~600 MB model on first use (one-time, then cached on disk and resident in each worker). This load takes several seconds; a large, late-session conversation can itself take a few seconds to compress. There is one worker timeout, and the client-facing wait is owned by Aperture:
