@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -98,9 +99,17 @@ type Pool struct {
 	maxCompress time.Duration    // hard cap on a single worker call before recycle
 	log         *slog.Logger
 
+	size int          // number of slots (for the saturation gauge)
+	busy atomic.Int64 // slots currently running a compression (for the gauge)
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+}
+
+// stats reports the pool's total and currently-busy slot counts for /metrics.
+func (p *Pool) stats() (total, busy int) {
+	return p.size, int(p.busy.Load())
 }
 
 // NewPool starts `size` slot goroutines, each spawning and supervising a worker
@@ -132,6 +141,7 @@ func newPool(size int, newCmd func() *exec.Cmd, maxCompress time.Duration, log *
 		newCmd:      newCmd,
 		maxCompress: maxCompress,
 		log:         log,
+		size:        size,
 		ctx:         ctx,
 		cancel:      cancel,
 	}
@@ -209,7 +219,9 @@ func (p *Pool) runSlot(idx int) {
 			// send never blocks even after the client has given up.
 			start := time.Now()
 			hardCtx, cancel := context.WithTimeout(p.ctx, p.maxCompress)
+			p.busy.Add(1)
 			res, err := w.do(hardCtx, j.req)
+			p.busy.Add(-1)
 			cancel()
 			dur := time.Since(start)
 			if err != nil {

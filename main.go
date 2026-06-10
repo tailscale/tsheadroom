@@ -66,17 +66,23 @@ func main() {
 	}, *maxCompress, log)
 	defer pool.Shutdown()
 
+	metrics := newMetrics()
+	metrics.poolStats = pool.stats
+
 	handler := &Handler{
 		comp:     pool,
 		settings: settings,
 		log:      log,
+		metrics:  metrics,
 		verbose:  *verbose,
 		out:      os.Stdout,
 	}
 
-	// /config is the runtime tuning API; everything else is the aperture hook.
+	// /config is the runtime tuning API; /metrics is the Prometheus scrape
+	// endpoint; everything else is the aperture hook.
 	mux := http.NewServeMux()
 	mux.Handle("/config", &configHandler{store: settings, log: log})
+	mux.Handle("/metrics", metrics)
 	mux.Handle("/", handler)
 	httpSrv := &http.Server{Handler: mux}
 
