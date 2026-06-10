@@ -13,6 +13,8 @@ import os
 import sys
 import types
 import unittest
+from importlib.metadata import PackageNotFoundError
+from unittest import mock
 
 # Make worker.py importable from the repo root.
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -199,6 +201,53 @@ class WarmupTest(unittest.TestCase):
         worker._warmup()
         # Just builds the pipeline; no text knob forced.
         self.assertNotIn("compress_user_messages", self.calls[-1]["kwargs"])
+
+
+class KompressRepoTest(unittest.TestCase):
+    """The default Kompress weights repo changed in headroom-ai 0.24.0
+    (kompress-base -> kompress-v2-base); worker resolves it from the installed
+    version so a single worker.py supports both, including mid-upgrade hosts."""
+
+    def _repo_for(self, version_value):
+        with mock.patch("importlib.metadata.version", return_value=version_value):
+            return worker._kompress_weights_repo()
+
+    def test_legacy_versions_use_kompress_base(self):
+        for v in ("0.23.0", "0.23.5", "0.1.0"):
+            self.assertEqual(self._repo_for(v), "chopratejas/kompress-base", v)
+
+    def test_v024_plus_uses_v2_base(self):
+        for v in ("0.24.0", "0.24.3", "0.25.0", "1.0.0"):
+            self.assertEqual(self._repo_for(v), "chopratejas/kompress-v2-base", v)
+
+    def test_unreadable_version_defaults_to_v2(self):
+        with mock.patch("importlib.metadata.version", side_effect=PackageNotFoundError):
+            self.assertEqual(worker._kompress_weights_repo(), "chopratejas/kompress-v2-base")
+
+    def test_odd_version_defaults_to_v2(self):
+        # A non-numeric component must not raise; fall back to the current default.
+        self.assertEqual(self._repo_for("unknown"), "chopratejas/kompress-v2-base")
+
+    def test_models_cached_tracks_resolved_repo(self):
+        # Inject a fake huggingface_hub so this runs without the real dependency.
+        def fake_hub(cached_ids):
+            repos = [types.SimpleNamespace(repo_id=i) for i in cached_ids]
+            mod = types.ModuleType("huggingface_hub")
+            mod.scan_cache_dir = lambda: types.SimpleNamespace(repos=repos)
+            return mod
+
+        # 0.24 host with both required repos cached -> safe to go offline.
+        both = {"answerdotai/ModernBERT-base", "chopratejas/kompress-v2-base"}
+        with mock.patch.dict(sys.modules, {"huggingface_hub": fake_hub(both)}), \
+                mock.patch("importlib.metadata.version", return_value="0.24.0"):
+            self.assertTrue(worker._models_cached())
+
+        # The upgrade trap: 0.24 installed but only the OLD model cached. We must
+        # NOT force offline (we'd block the v2 download), so _models_cached=False.
+        only_old = {"answerdotai/ModernBERT-base", "chopratejas/kompress-base"}
+        with mock.patch.dict(sys.modules, {"huggingface_hub": fake_hub(only_old)}), \
+                mock.patch("importlib.metadata.version", return_value="0.24.0"):
+            self.assertFalse(worker._models_cached())
 
 
 if __name__ == "__main__":

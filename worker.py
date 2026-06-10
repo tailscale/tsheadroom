@@ -48,19 +48,47 @@ from typing import Any
 # up as "unauthenticated requests to the HF Hub", adds latency to the first
 # request a worker serves, and risks anonymous rate-limiting across a pool. We
 # tame it *before* importing headroom (so transformers sees the env at import).
-_KOMPRESS_REPOS = ("answerdotai/ModernBERT-base", "chopratejas/kompress-base")
+#
+# ModernBERT is the Kompress tokenizer/encoder base, unchanged across versions.
+_MODERNBERT_REPO = "answerdotai/ModernBERT-base"
+
+
+def _kompress_weights_repo() -> str:
+    """HF repo holding the Kompress weights for the *installed* headroom-ai.
+
+    The default Kompress model changed in headroom-ai 0.24.0
+    (chopratejas/kompress-base -> chopratejas/kompress-v2-base). To support
+    hosts on either version (including ones mid-upgrade that still have only the
+    old model cached), we resolve the repo from the installed package version
+    rather than hardcoding one. We read the version via importlib.metadata and
+    never by importing headroom — importing it here would pull in transformers
+    before we've set the offline env, which is exactly what this module avoids.
+
+    On an unreadable/odd version we assume the current default (v2): the worst
+    case is then a stale guess that loses the offline optimization, never one
+    that forces offline against a model the installed version won't load."""
+    try:
+        from importlib.metadata import version
+
+        major, minor = (int(p) for p in version("headroom-ai").split(".")[:2])
+        if (major, minor) < (0, 24):
+            return "chopratejas/kompress-base"
+    except Exception:  # noqa: BLE001 - missing/odd version -> assume current default
+        pass
+    return "chopratejas/kompress-v2-base"
 
 
 def _models_cached() -> bool:
-    """True if the Kompress models are already in the local HF cache, so it's
-    safe to run transformers offline (no network needed to load them)."""
+    """True if the Kompress models the installed headroom will load are already
+    in the local HF cache, so it's safe to run transformers offline (no network
+    needed to load them)."""
     try:
         from huggingface_hub import scan_cache_dir
 
         repos = {r.repo_id for r in scan_cache_dir().repos}
     except Exception:  # noqa: BLE001 - hub missing/unscannable -> assume not cached
         return False
-    return set(_KOMPRESS_REPOS).issubset(repos)
+    return {_MODERNBERT_REPO, _kompress_weights_repo()}.issubset(repos)
 
 
 def _configure_hf_env() -> None:
