@@ -18,9 +18,21 @@ import (
 const maxBody = 50 << 20 // 50 MiB
 
 // hookCallData is the subset of aperture's HookCallData we consume. The hook is
-// configured with send: ["request_body"], so that is the only field we read.
+// configured with send: ["request_body"], so request_body is gated on that; the
+// metadata object is always sent regardless of send, which is where aperture
+// puts the resolved provider and model.
 type hookCallData struct {
+	Metadata    hookMetadata    `json:"metadata"`
 	RequestBody json.RawMessage `json:"request_body"`
+}
+
+// hookMetadata is the subset of aperture's always-present HookMetadata we use.
+// provider and model are populated unconditionally by aperture (not gated by
+// the hook's send config), so they're our authoritative source for both the
+// per-provider/per-model metrics and the model passed to compress().
+type hookMetadata struct {
+	Provider string `json:"provider"`
+	Model    string `json:"model"`
 }
 
 // guardrailResponse is aperture's GuardrailResponse. We only ever emit "allow"
@@ -67,16 +79,25 @@ type Handler struct {
 	comp     compressor
 	settings *settingsStore // current compress knobs, read per request
 	log      *slog.Logger   // operational logs + warnings (stderr)
+	metrics  *Metrics       // lifetime counters for /metrics (nil-safe; nil in tests)
 
 	verbose bool      // when set, emit a per-request summary to out
 	out     io.Writer // destination for verbose summaries (stdout)
 }
 
-// summary holds the numbers reported in the -v per-request line.
+// summary holds the numbers reported in the -v per-request line and folded into
+// /metrics.
 type summary struct {
 	inMessages int // number of messages received
 	inBytes    int // serialized size of received messages
 	outBytes   int // serialized size of returned messages
+
+	provider string // aperture-resolved provider (metrics label)
+	model    string // aperture-resolved model (metrics label)
+
+	tokensBefore int // res.TokensBefore (0 when no worker result)
+	tokensSaved  int // res.TokensSaved (0 when no worker result)
+	tokensAfter  int // res.TokensAfter (0 when no worker result)
 
 	workerMs   float64 // worker-reported compress() time (0 when no worker result)
 	cold       bool    // worker's first real request (paid the cold model load)
@@ -85,6 +106,9 @@ type summary struct {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.metrics.inboundStart()
+	defer h.metrics.inboundDone()
+
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -92,11 +116,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 	resp, s := h.process(r)
+	durMs := float64(time.Since(start).Microseconds()) / 1000
 
 	if h.verbose {
-		fmt.Fprintf(h.out, "request in_msgs=%d in_bytes=%d out_bytes=%d dur_ms=%d worker_ms=%.0f cold=%t model_limit=%d -> %s\n",
-			s.inMessages, s.inBytes, s.outBytes, time.Since(start).Milliseconds(), s.workerMs, s.cold, s.modelLimit, s.reason)
+		fmt.Fprintf(h.out, "request in_msgs=%d in_bytes=%d out_bytes=%d dur_ms=%.0f worker_ms=%.0f cold=%t model_limit=%d -> %s\n",
+			s.inMessages, s.inBytes, s.outBytes, durMs, s.workerMs, s.cold, s.modelLimit, s.reason)
 	}
+	h.metrics.record(s, durMs)
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -121,25 +147,30 @@ func (h *Handler) process(r *http.Request) (guardrailResponse, summary) {
 	// return the whole thing (aperture rejects non-object modified bodies).
 	var reqBody map[string]any
 	if err := json.Unmarshal(data.RequestBody, &reqBody); err != nil {
-		return allow, summary{reason: "allow(passthrough)"}
+		return allow, summary{reason: "allow(passthrough)", provider: data.Metadata.Provider, model: data.Metadata.Model}
 	}
 
 	// v1 handles only the `messages` shape (Anthropic/OpenAI). Anything else
 	// (e.g. Gemini's `contents`, embeddings) passes through untouched.
 	rawMessages, ok := reqBody["messages"]
 	if !ok {
-		return allow, summary{reason: "allow(passthrough)"}
+		return allow, summary{reason: "allow(passthrough)", provider: data.Metadata.Provider, model: data.Metadata.Model}
 	}
 	messages, ok := rawMessages.([]any)
 	if !ok {
-		return allow, summary{reason: "allow(passthrough)"}
+		return allow, summary{reason: "allow(passthrough)", provider: data.Metadata.Provider, model: data.Metadata.Model}
 	}
-	model, _ := reqBody["model"].(string) // absent/non-string -> worker default
+	// Prefer aperture's resolved metadata.model (always present, authoritative);
+	// fall back to the request body's own model field. Empty -> worker default.
+	model := data.Metadata.Model
+	if model == "" {
+		model, _ = reqBody["model"].(string)
+	}
 
 	// Byte sizes are only used for the -v summary; skip the marshal otherwise
 	// (messages can be multi-MB). The message count is cheap, so keep it.
 	// For an allow result, output size equals input size (body unchanged).
-	s := summary{inMessages: len(messages)}
+	s := summary{inMessages: len(messages), provider: data.Metadata.Provider, model: model}
 	if h.verbose {
 		s.inBytes = jsonLen(messages)
 		s.outBytes = s.inBytes
@@ -161,11 +192,15 @@ func (h *Handler) process(r *http.Request) (guardrailResponse, summary) {
 		s.reason = "allow(error)"
 		return allow, s
 	}
-	// Worker timing/cold/limit are available for both noop and modify; record
-	// them so the -v line shows them regardless of the outcome.
+	// Worker timing/cold/limit and token counts are available for both noop and
+	// modify; record them so the -v line and /metrics reflect them regardless of
+	// the outcome.
 	s.workerMs = res.ElapsedMs
 	s.cold = res.ColdFirstCall
 	s.modelLimit = res.ModelLimit
+	s.tokensBefore = res.TokensBefore
+	s.tokensSaved = res.TokensSaved
+	s.tokensAfter = res.TokensAfter
 	if res.TokensSaved <= 0 {
 		// No-op: nothing meaningful to change, so don't rewrite the body.
 		s.reason = "allow(noop)"
