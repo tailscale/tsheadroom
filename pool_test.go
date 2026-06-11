@@ -391,3 +391,43 @@ func TestPool_AffinityDisabledUsesShared(t *testing.T) {
 		t.Errorf("affinity disabled stats = (hits=%d, spills=%d), want (0, 0)", hits, spills)
 	}
 }
+
+// A job buffered into a slot's affinity channel (its slot busy) must be answered
+// with an error on shutdown, not orphaned — otherwise its Compress caller blocks
+// on j.resp forever.
+func TestPool_ShutdownAnswersBufferedAffinityJob(t *testing.T) {
+	p := testPoolCap(t, 1, time.Second)
+
+	// Occupy the single slot's worker with a long call on key "K".
+	go func() {
+		_, _ = mustCompress(t, p, compressRequest{Messages: []any{"x"}, Model: "HANG", AffinityKey: "K"}, 30*time.Second)
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for p.busy.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("worker never became busy")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// A second same-key job buffers into the now-busy slot's affinity channel.
+	// Use a non-cancelable context so only the pool can unblock it: if the job
+	// were orphaned, this would hang.
+	bufferedErr := make(chan error, 1)
+	go func() {
+		_, err := p.Compress(context.Background(), compressRequest{Messages: []any{"y"}, AffinityKey: "K"})
+		bufferedErr <- err
+	}()
+	time.Sleep(50 * time.Millisecond) // let the buffered send land
+
+	go p.Shutdown()
+
+	select {
+	case err := <-bufferedErr:
+		if err == nil {
+			t.Fatal("buffered job returned nil error on shutdown, want an error")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("buffered affinity job hung on shutdown (never answered)")
+	}
+}

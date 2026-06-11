@@ -189,8 +189,6 @@ func newPool(size int, newCmd func() *exec.Cmd, maxCompress time.Duration, log *
 		// its warm slot, so back-to-back turns reliably reuse the same worker
 		// instead of racing the slot's re-park. Deeper contention spills.
 		p.affinity[i] = make(chan job, 1)
-	}
-	for i := 0; i < size; i++ {
 		p.wg.Add(1)
 		go p.runSlot(i)
 	}
@@ -225,13 +223,25 @@ func (p *Pool) Compress(ctx context.Context, req compressRequest) (*compressResu
 }
 
 // dispatch places j on a worker, bounded by ctx and pool shutdown. With affinity
-// enabled and a key present, it first tries a non-blocking send to the
-// conversation's slot, which succeeds as long as that slot isn't already holding
-// a queued job (buffer depth 1) — so repeated turns of a conversation land on the
-// same worker and reuse headroom's warm per-process cache, even back-to-back. If
-// that slot's buffer is full, it spills to the shared channel, which any idle slot
-// serves; the spill is counted as a likely cache miss.
+// enabled and a key present, it tries a non-blocking send to the conversation's
+// slot: this succeeds when the slot is idle (handed straight to the receiver) or
+// when its depth-1 buffer is empty (queued one deep), so repeated turns of a
+// conversation land on the same worker and reuse headroom's warm per-process
+// cache, even back-to-back. If that slot is busy and its buffer is full, j spills
+// to the shared channel, which any idle slot serves; the spill is counted as a
+// likely (not certain) cache miss. A shutting-down pool fails fast on every path,
+// so a caller never blocks on a job that will never be served.
 func (p *Pool) dispatch(ctx context.Context, j job) error {
+	// Fail fast if the pool is already shutting down — otherwise an affinity
+	// send could buffer a job into a slot that has already exited, leaving the
+	// caller waiting on j.resp forever. Shutdown also drains any job that slips
+	// through the gap between this check and the send below.
+	select {
+	case <-p.ctx.Done():
+		return errors.New("pool shutting down")
+	default:
+	}
+
 	affined := p.affinityEnabled && j.req.AffinityKey != ""
 	if affined {
 		select {
@@ -256,10 +266,29 @@ func (p *Pool) dispatch(ctx context.Context, j job) error {
 }
 
 // Shutdown stops all slots and their workers. A slot mid-call finishes it first
-// (bounded by the hard cap), then tears down its worker.
+// (bounded by the hard cap), then tears down its worker. Any job left buffered in
+// an affinity channel (sent just as its slot exited) is answered with an error so
+// its Compress caller doesn't block on j.resp.
 func (p *Pool) Shutdown() {
 	p.cancel()
 	p.wg.Wait()
+	for _, ch := range p.affinity {
+		drainBuffered(ch)
+	}
+}
+
+// drainBuffered replies "pool shutting down" to every job still buffered in ch.
+// Called only after all slot goroutines have exited (wg.Wait), so there is no
+// competing receiver; j.resp is buffered, so the reply never blocks.
+func drainBuffered(ch chan job) {
+	for {
+		select {
+		case j := <-ch:
+			j.resp <- jobResult{err: errors.New("pool shutting down")}
+		default:
+			return
+		}
+	}
 }
 
 // runSlot owns one worker for the slot's lifetime, respawning on death.
