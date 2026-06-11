@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log/slog"
 	"os"
@@ -26,6 +27,12 @@ type compressRequest struct {
 	Messages []any            `json:"messages"`
 	Model    string           `json:"model,omitempty"`
 	Config   CompressSettings `json:"config"`
+
+	// AffinityKey routes a conversation to a consistent worker so headroom's
+	// per-process compression cache (a process-global pipeline singleton) stays
+	// warm across the conversation's turns. Go-internal only — never sent to the
+	// worker (json:"-").
+	AffinityKey string `json:"-"`
 }
 
 // compressResult mirrors the fields worker.py projects from headroom's
@@ -90,17 +97,31 @@ type jobResult struct {
 // Pool runs a fixed number of supervised Python workers. Each "slot" goroutine
 // owns exactly one worker process at a time, so a worker is never touched
 // concurrently — concurrency comes from the number of slots, not from
-// multiplexing a single stdio stream. Jobs are dispatched over an unbuffered
-// channel, which doubles as backpressure: Compress blocks (until its deadline)
-// when every slot is busy.
+// multiplexing a single stdio stream.
+//
+// Dispatch is session-affinity-aware: each slot has its own affinity channel
+// (buffered depth 1), plus one shared spillover channel all slots also serve.
+// Compress routes a conversation to its affinity slot — so headroom's per-process
+// compression cache stays warm across that conversation's turns — queuing at most
+// one job deep on that slot, and spilling to the shared channel only when the slot
+// already has a job waiting. The shared channel is unbuffered, so it doubles as
+// backpressure: Compress blocks (until its deadline) when every slot is busy and
+// the affinity slot's buffer is full.
 type Pool struct {
-	jobs        chan job
+	affinity []chan job // per-slot channels for affinity-routed jobs
+	shared   chan job   // spillover: any idle slot serves these
+
 	newCmd      func() *exec.Cmd // builds a fresh worker process
 	maxCompress time.Duration    // hard cap on a single worker call before recycle
 	log         *slog.Logger
 
+	affinityEnabled bool // when false, every job uses the shared channel
+
 	size int          // number of slots (for the saturation gauge)
 	busy atomic.Int64 // slots currently running a compression (for the gauge)
+
+	affinityHits   atomic.Int64 // jobs routed straight to their affinity slot
+	affinitySpills atomic.Int64 // affinity-eligible jobs whose slot was busy -> shared
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -110,6 +131,22 @@ type Pool struct {
 // stats reports the pool's total and currently-busy slot counts for /metrics.
 func (p *Pool) stats() (total, busy int) {
 	return p.size, int(p.busy.Load())
+}
+
+// affinityStats reports affinity hit/spill counts for /metrics. hits+spills is
+// the number of affinity-eligible jobs; hit rate = hits/(hits+spills).
+func (p *Pool) affinityStats() (hits, spills int64) {
+	return p.affinityHits.Load(), p.affinitySpills.Load()
+}
+
+// slotFor maps an affinity key to a slot index (stable for a given key/size).
+func slotFor(key string, size int) int {
+	if size <= 1 {
+		return 0
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	return int(h.Sum32() % uint32(size))
 }
 
 // NewPool starts `size` slot goroutines, each spawning and supervising a worker
@@ -137,13 +174,21 @@ func NewPool(size int, python, script string, preload func() bool, maxCompress t
 func newPool(size int, newCmd func() *exec.Cmd, maxCompress time.Duration, log *slog.Logger) *Pool {
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &Pool{
-		jobs:        make(chan job),
-		newCmd:      newCmd,
-		maxCompress: maxCompress,
-		log:         log,
-		size:        size,
-		ctx:         ctx,
-		cancel:      cancel,
+		affinity:        make([]chan job, size),
+		shared:          make(chan job),
+		newCmd:          newCmd,
+		maxCompress:     maxCompress,
+		log:             log,
+		affinityEnabled: true,
+		size:            size,
+		ctx:             ctx,
+		cancel:          cancel,
+	}
+	for i := 0; i < size; i++ {
+		// Buffered (depth 1): a conversation can queue at most one job ahead on
+		// its warm slot, so back-to-back turns reliably reuse the same worker
+		// instead of racing the slot's re-park. Deeper contention spills.
+		p.affinity[i] = make(chan job, 1)
 	}
 	for i := 0; i < size; i++ {
 		p.wg.Add(1)
@@ -161,12 +206,8 @@ func newPool(size int, newCmd func() *exec.Cmd, maxCompress time.Duration, log *
 // and leave the worker warm, so the next call succeeds — no restart needed.
 func (p *Pool) Compress(ctx context.Context, req compressRequest) (*compressResult, error) {
 	j := job{req: req, resp: make(chan jobResult, 1)}
-	select {
-	case p.jobs <- j:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-p.ctx.Done():
-		return nil, errors.New("pool shutting down")
+	if err := p.dispatch(ctx, j); err != nil {
+		return nil, err
 	}
 	select {
 	case r := <-j.resp:
@@ -180,6 +221,37 @@ func (p *Pool) Compress(ctx context.Context, req compressRequest) (*compressResu
 		// worker's first large request — is visible.
 		p.log.Warn("request canceled before worker finished; failing open (worker continues, warming)", "err", ctx.Err())
 		return nil, ctx.Err()
+	}
+}
+
+// dispatch places j on a worker, bounded by ctx and pool shutdown. With affinity
+// enabled and a key present, it first tries a non-blocking send to the
+// conversation's slot, which succeeds as long as that slot isn't already holding
+// a queued job (buffer depth 1) — so repeated turns of a conversation land on the
+// same worker and reuse headroom's warm per-process cache, even back-to-back. If
+// that slot's buffer is full, it spills to the shared channel, which any idle slot
+// serves; the spill is counted as a likely cache miss.
+func (p *Pool) dispatch(ctx context.Context, j job) error {
+	affined := p.affinityEnabled && j.req.AffinityKey != ""
+	if affined {
+		select {
+		case p.affinity[slotFor(j.req.AffinityKey, p.size)] <- j:
+			p.affinityHits.Add(1)
+			return nil
+		default:
+			// preferred slot busy; fall through to spillover
+		}
+	}
+	select {
+	case p.shared <- j:
+		if affined {
+			p.affinitySpills.Add(1)
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-p.ctx.Done():
+		return errors.New("pool shutting down")
 	}
 }
 
@@ -201,41 +273,46 @@ func (p *Pool) runSlot(idx int) {
 	}()
 
 	for {
+		// Serve this slot's affinity-routed jobs and shared spillover equally;
+		// an idle slot takes whichever is ready first.
+		var j job
 		select {
 		case <-p.ctx.Done():
 			return
-		case j := <-p.jobs:
-			if w == nil {
-				if w = p.spawn(idx); w == nil {
-					j.resp <- jobResult{err: errors.New("worker unavailable")}
-					return // spawn only returns nil on pool shutdown
-				}
-			}
-			// Run under the pool's hard cap, NOT the request context. Compress
-			// already fails open on that ctx; here we let the worker keep going
-			// so a slow call (e.g. a model load) finishes
-			// and leaves the worker warm. Only a real error or the hard cap
-			// (genuinely wedged) recycles the worker. j.resp is buffered, so the
-			// send never blocks even after the client has given up.
-			start := time.Now()
-			hardCtx, cancel := context.WithTimeout(p.ctx, p.maxCompress)
-			p.busy.Add(1)
-			res, err := w.do(hardCtx, j.req)
-			p.busy.Add(-1)
-			cancel()
-			dur := time.Since(start)
-			if err != nil {
-				p.log.Warn("worker request failed; recycling", "slot", idx, "dur", dur, "err", err)
-				w.kill()
-				w = p.spawn(idx)
-			} else if dur >= slowCallLog {
-				// Surface slow calls without requiring -v; cold_first_call
-				// pinpoints the one-time ML model load.
-				p.log.Info("slow worker call", "slot", idx, "dur", dur,
-					"cold_first_call", res.ColdFirstCall, "worker_ms", res.ElapsedMs)
-			}
-			j.resp <- jobResult{result: res, err: err}
+		case j = <-p.affinity[idx]:
+		case j = <-p.shared:
 		}
+
+		if w == nil {
+			if w = p.spawn(idx); w == nil {
+				j.resp <- jobResult{err: errors.New("worker unavailable")}
+				return // spawn only returns nil on pool shutdown
+			}
+		}
+		// Run under the pool's hard cap, NOT the request context. Compress
+		// already fails open on that ctx; here we let the worker keep going
+		// so a slow call (e.g. a model load) finishes
+		// and leaves the worker warm. Only a real error or the hard cap
+		// (genuinely wedged) recycles the worker. j.resp is buffered, so the
+		// send never blocks even after the client has given up.
+		start := time.Now()
+		hardCtx, cancel := context.WithTimeout(p.ctx, p.maxCompress)
+		p.busy.Add(1)
+		res, err := w.do(hardCtx, j.req)
+		p.busy.Add(-1)
+		cancel()
+		dur := time.Since(start)
+		if err != nil {
+			p.log.Warn("worker request failed; recycling", "slot", idx, "dur", dur, "err", err)
+			w.kill()
+			w = p.spawn(idx)
+		} else if dur >= slowCallLog {
+			// Surface slow calls without requiring -v; cold_first_call
+			// pinpoints the one-time ML model load.
+			p.log.Info("slow worker call", "slot", idx, "dur", dur,
+				"cold_first_call", res.ColdFirstCall, "worker_ms", res.ElapsedMs)
+		}
+		j.resp <- jobResult{result: res, err: err}
 	}
 }
 

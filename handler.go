@@ -7,9 +7,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -31,8 +33,9 @@ type hookCallData struct {
 // the hook's send config), so they're our authoritative source for both the
 // per-provider/per-model metrics and the model passed to compress().
 type hookMetadata struct {
-	Provider string `json:"provider"`
-	Model    string `json:"model"`
+	Provider  string `json:"provider"`
+	Model     string `json:"model"`
+	SessionID string `json:"session_id"`
 }
 
 // guardrailResponse is aperture's GuardrailResponse. We only ever emit "allow"
@@ -183,9 +186,10 @@ func (h *Handler) process(r *http.Request) (guardrailResponse, summary) {
 	// compressions this tool exists to perform. The latency ceiling belongs to
 	// aperture's per-hook `timeout`, which is owned by the caller.
 	res, err := h.comp.Compress(r.Context(), compressRequest{
-		Messages: messages,
-		Model:    model,
-		Config:   h.settings.get(),
+		Messages:    messages,
+		Model:       model,
+		Config:      h.settings.get(),
+		AffinityKey: affinityKey(data.Metadata.SessionID, messages),
 	})
 	if err != nil {
 		h.log.Warn("compress failed; allowing", "err", err)
@@ -225,4 +229,28 @@ func jsonLen(v any) int {
 		return 0
 	}
 	return len(b)
+}
+
+// affinityKey returns a routing key that pins a conversation to one worker so
+// headroom's per-process compression cache stays warm across its turns. It
+// prefers aperture's session_id (always sent in metadata, stable per session);
+// when absent it falls back to a hash of the opening messages (system + first
+// user message), which is stable across a conversation's turns yet distinct
+// between conversations. Empty only when there are no messages at all.
+func affinityKey(sessionID string, messages []any) string {
+	if sessionID != "" {
+		return sessionID
+	}
+	if len(messages) == 0 {
+		return ""
+	}
+	h := fnv.New64a()
+	for i, m := range messages {
+		if i >= 2 { // system + first user message is enough to distinguish
+			break
+		}
+		b, _ := json.Marshal(m)
+		_, _ = h.Write(b)
+	}
+	return strconv.FormatUint(h.Sum64(), 16)
 }

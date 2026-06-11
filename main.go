@@ -40,6 +40,7 @@ func main() {
 		configF     = flag.String("config", "tsheadroom.config.json", "path to the tunable compress-config file (created/updated via PUT /config)")
 		localAddr   = flag.String("local-addr", "", "if set, serve plain HTTP here instead of tsnet (for local testing)")
 		verbose     = flag.Bool("v", false, "log a per-request summary (in/out sizes, modify/allow) to stdout")
+		noAffinity  = flag.Bool("no-affinity", false, "disable session-affinity worker routing (dispatch every request to any free worker)")
 	)
 	flag.Parse()
 
@@ -64,10 +65,12 @@ func main() {
 	pool := NewPool(*poolSize, *python, scriptPath, func() bool {
 		return settings.get().textEnabled()
 	}, *maxCompress, log)
+	pool.affinityEnabled = !*noAffinity
 	defer pool.Shutdown()
 
 	metrics := newMetrics()
 	metrics.poolStats = pool.stats
+	metrics.affinityStats = pool.affinityStats
 
 	handler := &Handler{
 		comp:     pool,

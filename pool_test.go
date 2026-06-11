@@ -10,6 +10,8 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -59,6 +61,8 @@ func TestHelperProcess(t *testing.T) {
 			os.Exit(1) // die without responding
 		case "HANG":
 			time.Sleep(30 * time.Second) // longer than any test deadline
+		case "SLEEP":
+			time.Sleep(400 * time.Millisecond) // pin a slot busy briefly
 		case "SLOW_ONCE":
 			if calls == 1 {
 				// Slow first call (like a one-time model load), then fast.
@@ -80,7 +84,7 @@ func TestHelperProcess(t *testing.T) {
 			TokensAfter:       40,
 			TokensSaved:       60,
 			CompressionRatio:  0.4,
-			TransformsApplied: []string{"fake"},
+			TransformsApplied: []string{"fake", "pid:" + strconv.Itoa(os.Getpid())},
 		}})
 	}
 }
@@ -281,5 +285,109 @@ func TestPool_ShutdownIsPrompt(t *testing.T) {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("Shutdown did not return promptly")
+	}
+}
+
+// workerPID extracts the serving worker's pid, which the fake worker stamps into
+// TransformsApplied, so a test can tell which worker (slot) served a request.
+func workerPID(t *testing.T, res *compressResult) string {
+	t.Helper()
+	for _, s := range res.TransformsApplied {
+		if strings.HasPrefix(s, "pid:") {
+			return s
+		}
+	}
+	t.Fatalf("no pid stamp in transforms: %v", res.TransformsApplied)
+	return ""
+}
+
+func TestSlotFor(t *testing.T) {
+	// Deterministic and in range.
+	for _, n := range []int{2, 4, 8} {
+		first := slotFor("conv-xyz", n)
+		for i := 0; i < 100; i++ {
+			if got := slotFor("conv-xyz", n); got != first {
+				t.Fatalf("slotFor not deterministic: %d vs %d", got, first)
+			}
+		}
+		if first < 0 || first >= n {
+			t.Errorf("slotFor out of range: %d for size %d", first, n)
+		}
+	}
+	// Degenerate sizes never panic and pin to slot 0.
+	if got := slotFor("k", 1); got != 0 {
+		t.Errorf("slotFor size 1 = %d, want 0", got)
+	}
+	if got := slotFor("k", 0); got != 0 {
+		t.Errorf("slotFor size 0 = %d, want 0", got)
+	}
+}
+
+// Sequential (uncontended) requests sharing an affinity key must all land on the
+// same worker, so headroom's per-process cache stays warm. Different keys are
+// free to use other workers.
+func TestPool_AffinitySameKeySameWorker(t *testing.T) {
+	p := testPool(t, 4)
+	var pid string
+	for i := 0; i < 5; i++ {
+		res, err := mustCompress(t, p, compressRequest{Messages: []any{"x"}, AffinityKey: "conv-A"}, 5*time.Second)
+		if err != nil {
+			t.Fatalf("request %d: %v", i, err)
+		}
+		got := workerPID(t, res)
+		if pid == "" {
+			pid = got
+		} else if got != pid {
+			t.Fatalf("same key landed on different workers: %s vs %s", pid, got)
+		}
+	}
+	if hits, spills := p.affinityStats(); hits != 5 || spills != 0 {
+		t.Errorf("affinity stats = (hits=%d, spills=%d), want (5, 0)", hits, spills)
+	}
+}
+
+// Under concurrency, a conversation's warm slot can hold at most one running plus
+// one queued job; further same-key requests must spill to other workers rather
+// than pile up unboundedly on the warm one.
+func TestPool_AffinitySpillUnderContention(t *testing.T) {
+	p := testPool(t, 3)
+
+	const n = 8
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// SLEEP holds each slot ~400ms so the warm slot's buffer fills and
+			// the rest are forced to spill.
+			_, _ = mustCompress(t, p, compressRequest{Messages: []any{"x"}, Model: "SLEEP", AffinityKey: "conv-B"}, 10*time.Second)
+		}()
+	}
+	wg.Wait()
+
+	hits, spills := p.affinityStats()
+	if hits+spills != n {
+		t.Errorf("affinity-eligible count = %d, want %d (hits=%d, spills=%d)", hits+spills, n, hits, spills)
+	}
+	if hits == 0 {
+		t.Errorf("expected at least one warm-slot hit, got 0")
+	}
+	if spills == 0 {
+		t.Errorf("expected spills under contention, got 0 (hits=%d)", hits)
+	}
+}
+
+// With affinity disabled, an affinity key is ignored: every request uses the
+// shared channel, so the hit/spill counters stay at zero.
+func TestPool_AffinityDisabledUsesShared(t *testing.T) {
+	p := testPool(t, 2)
+	p.affinityEnabled = false
+	for i := 0; i < 3; i++ {
+		if _, err := mustCompress(t, p, compressRequest{Messages: []any{"x"}, AffinityKey: "conv-C"}, 5*time.Second); err != nil {
+			t.Fatalf("request %d: %v", i, err)
+		}
+	}
+	if hits, spills := p.affinityStats(); hits != 0 || spills != 0 {
+		t.Errorf("affinity disabled stats = (hits=%d, spills=%d), want (0, 0)", hits, spills)
 	}
 }
