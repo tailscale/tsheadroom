@@ -54,6 +54,10 @@ type Metrics struct {
 	// poolStats, when set, returns (total slots, busy slots) for the live pool
 	// gauges. nil in tests or before wiring; the gauges are then omitted.
 	poolStats func() (total, busy int)
+
+	// affinityStats, when set, returns (hits, spills) for session-affinity
+	// dispatch. nil in tests or before wiring; the counters are then omitted.
+	affinityStats func() (hits, spills int64)
 }
 
 func newMetrics() *Metrics {
@@ -219,6 +223,12 @@ func (m *Metrics) export() string {
 		total, busy := m.poolStats()
 		scalar(&b, "tsheadroom_pool_slots_total", "gauge", "Total worker slots in the pool", int64(total))
 		scalar(&b, "tsheadroom_pool_slots_busy", "gauge", "Worker slots currently running a compression", int64(busy))
+	}
+
+	if m.affinityStats != nil {
+		hits, spills := m.affinityStats()
+		scalar(&b, "tsheadroom_affinity_hits_total", "counter", "Requests routed straight to their affinity worker (warm-cache hit)", hits)
+		scalar(&b, "tsheadroom_affinity_spills_total", "counter", "Affinity-eligible requests whose worker was busy and spilled to another", spills)
 	}
 
 	return b.String()

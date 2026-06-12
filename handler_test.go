@@ -226,3 +226,42 @@ func TestHandler_RejectsNonPost(t *testing.T) {
 		t.Fatalf("GET status = %d, want 405", rec.Code)
 	}
 }
+
+func TestAffinityKey(t *testing.T) {
+	msgs := []any{
+		map[string]any{"role": "system", "content": "you are a coding agent"},
+		map[string]any{"role": "user", "content": "fix the bug in pool.go"},
+		map[string]any{"role": "assistant", "content": "on it"},
+	}
+
+	// session_id, when present, is the key verbatim.
+	if got := affinityKey("sess-123", msgs); got != "sess-123" {
+		t.Errorf("with session_id: got %q, want sess-123", got)
+	}
+
+	// Without session_id, the key is derived from the opening messages and is
+	// stable across turns of the same conversation (more messages appended).
+	grown := append(append([]any{}, msgs...), map[string]any{"role": "user", "content": "and add a test"})
+	k1 := affinityKey("", msgs)
+	k2 := affinityKey("", grown)
+	if k1 == "" {
+		t.Fatal("fallback key should be non-empty")
+	}
+	if k1 != k2 {
+		t.Errorf("key not stable across turns: %q vs %q", k1, k2)
+	}
+
+	// A different conversation (different first user message) gets a different key.
+	other := []any{
+		map[string]any{"role": "system", "content": "you are a coding agent"},
+		map[string]any{"role": "user", "content": "write the README"},
+	}
+	if affinityKey("", other) == k1 {
+		t.Errorf("distinct conversations collided on key %q", k1)
+	}
+
+	// No messages and no session_id -> empty (pool falls back to shared dispatch).
+	if got := affinityKey("", nil); got != "" {
+		t.Errorf("empty input: got %q, want empty", got)
+	}
+}

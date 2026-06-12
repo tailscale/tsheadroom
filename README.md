@@ -181,6 +181,7 @@ WantedBy=multi-user.target
 | `-config` | `tsheadroom.config.json` | Path to the tunable compression configuration file. Loaded at startup, rewritten on `PUT /config`. |
 | `-local-addr` | off | Serve plain HTTP here instead of tsnet, for local testing only. |
 | `-v` | off | Log a one-line per-request summary to stdout. See [Verify](#verify-its-working). |
+| `-no-affinity` | off | Disable session-affinity worker routing; dispatch every request to any free worker. See [Worker affinity](#worker-affinity). |
 
 > **State (`-state-dir`)**: must be a stable, writable, persistent path. It contains `tailscaled.state`, the device's private key. Treat it as a secret and keep it on durable storage, or the device re-authenticates as a *new* device on every restart.
 >
@@ -412,6 +413,7 @@ The `tsheadroom_*` metrics have no Headroom analog and describe this service spe
 | metric | type | meaning |
 |---|---|---|
 | `tsheadroom_pool_slots_total` / `tsheadroom_pool_slots_busy` | gauge | Worker-pool size and how many slots are compressing right now. When `busy` sits at `total`, the pool is saturated and new requests queue (see [ML model loading and timeouts](#ml-model-loading-and-timeouts)). |
+| `tsheadroom_affinity_hits_total` / `tsheadroom_affinity_spills_total` | counter | Session-affinity routing outcomes. A *hit* is a request sent to its conversation's warm worker; a *spill* is one whose worker was busy and went elsewhere (a likely cold recompress). A falling hit rate signals worker contention. See [Worker affinity](#worker-affinity). |
 | `tsheadroom_requests_by_outcome{outcome}` | counter | Requests by outcome: `modify`, `noop`, `error`, `passthrough`, `read_error`. |
 | `tsheadroom_cold_starts_total` | counter | Worker first-real-call events that paid the one-time ML model load. |
 | `tsheadroom_tokens_after_total` | counter | Output tokens after compression (`tokens_after`), so you can compute the realized ratio. |
@@ -419,6 +421,14 @@ The `tsheadroom_*` metrics have no Headroom analog and describe this service spe
 > **Why a subset?** tsheadroom is a `pre_request` hook, not a proxy: it runs `headroom.compress()` and never sees the upstream response. So Headroom proxy metrics that depend on the response or on prompt caching — completion tokens, TTFB, end-to-end latency, cache reads/writes and busts, per-transform timing, waste signals — have no source here and are deliberately omitted rather than reported as misleading zeros.
 
 > **Access**: like `/config`, `/metrics` is gated only by your tailnet policy file. Anyone who can reach the device can read it; it exposes aggregate counts and model/provider names, not request contents.
+
+## Worker affinity
+
+Headroom's `compress()` keeps a per-process cache of already-compressed content (a process-global pipeline with a content-keyed cache, ~30-minute TTL). So within one worker, a growing conversation does **not** recompress its unchanged prefix every turn — only genuinely new content runs through the model. In practice the same large tool result costs tens of milliseconds the first time a worker sees it and ~1 ms on later turns.
+
+That cache only helps if a conversation's turns keep landing on the **same** worker. tsheadroom therefore routes by conversation: each request is dispatched to a worker chosen from its `session_id` (from Aperture's hook metadata; when absent, a stable hash of the opening messages). Each worker has a one-deep affinity queue, so back-to-back turns reliably reuse the warm worker; if that worker is already busy with a queued job, the request **spills** to any free worker (a likely cold recompress) rather than blocking. `tsheadroom_affinity_hits_total` / `tsheadroom_affinity_spills_total` expose the split.
+
+This is best-effort by design: under sustained load, spills route to cold workers and erode the benefit. The planned next step is bounded per-worker queueing so a turn waits a short, capped time for its warm worker instead of spilling. Pass `-no-affinity` to disable routing entirely and dispatch every request to any free worker.
 
 ### ML model loading and timeouts
 
