@@ -167,6 +167,39 @@ WantedBy=multi-user.target
 
 `StateDirectory=tsheadroom` provisions `/var/lib/tsheadroom` with the right ownership. After the device has authenticated once, you can drop the `TS_AUTHKEY` line.
 
+### Run it with Docker
+
+If you'd rather not set up a Go toolchain, a virtualenv, and a `systemd` unit by hand, the repo ships a `Dockerfile` and `docker-compose.yml` that build and run tsheadroom for you. You can skip the [Install](#install) and [Run](#run) steps above; deploys and updates become a single `docker compose up -d --build`.
+
+```shell
+git clone https://github.com/tailscale/tsheadroom.git
+cd tsheadroom
+
+cp .env.example .env                                       # set TS_AUTHKEY, variant, pool size
+mkdir -p config && cp tsheadroom.config.example.json config/config.json
+
+docker compose up -d --build
+```
+
+This builds the binary, installs `headroom-ai`, joins your tailnet as `tsheadroom`, and serves the hook on `:80` — the same result as the manual install, in one command. Settings live in `.env` (what `.env.example` ships with):
+
+| Variable | `.env.example` | Description |
+|---|---|---|
+| `TS_AUTHKEY` | — | Tailscale [auth key](https://tailscale.com/docs/features/access-control/auth-keys); only needed until the device authenticates once. |
+| `TS_HOSTNAME` | `tsheadroom` | Device name on the tailnet. |
+| `HEADROOM_VARIANT` | `ml` | `base` for tool-output compression, `ml` for text + tool compression (installs `headroom-ai[ml]`). See [Choose tool-output or text compression](#choose-tool-output-or-text-compression). Changing it needs a rebuild. |
+| `POOL_SIZE` | `4` | Number of Python workers; each holds a resident copy of the ML model under `ml`. |
+
+The device identity and the HuggingFace model cache persist in named volumes (`tsheadroom-state`, `tsheadroom-hf-cache`), so restarts never re-authenticate the device or re-download the ~600 MB model. Compression knobs live in the bind-mounted `config/config.json`: edit it and restart, or change them live with `PUT /config` (see [Tune compression](#tune-compression-runtime-config)).
+
+Update to a newer version with:
+
+```shell
+git pull && docker compose up -d --build
+```
+
+> **Migrating from a manual or `systemd` install?** Before the first `up`, copy your existing `-state-dir` into the `tsheadroom-state` volume (and `~/.cache/huggingface` into `tsheadroom-hf-cache`) so the container keeps the same device identity and skips the model download. Stop the old service first — the two can't share one tailnet identity.
+
 ### Flags
 
 | Flag | Default | Description |

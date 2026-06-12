@@ -1,0 +1,9 @@
+{
+  "compress_user_messages": false,
+  "compress_system_messages": true,
+  "protect_recent": 4,
+  "protect_analysis_context": true,
+  "target_ratio": null,
+  "min_tokens_to_compress": 250,
+  "kompress_model": null
+}

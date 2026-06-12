@@ -16,6 +16,9 @@ __pycache__/
 /tsheadroom.config.json
 *.config.json.tmp
 
+# Local Docker config dir (bind-mounted into the container); copy of the example.
+/config/
+
 # tsnet state — contains tailscaled.state (the node's private key). Never commit.
 # `t/` is the conventional local -state-dir; also guard the state files by name.
 /t/
