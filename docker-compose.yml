@@ -1,0 +1,32 @@
+services:
+  tsheadroom:
+    build:
+      context: .
+      args:
+        HEADROOM_VARIANT: ${HEADROOM_VARIANT:-base}
+    command:
+      - -python
+      - /venv/bin/python
+      - -worker
+      - /app/worker.py
+      - -hostname
+      - ${TS_HOSTNAME:-tsheadroom}
+      - -pool-size
+      - "${POOL_SIZE:-4}"
+      - -state-dir
+      - /var/lib/tsheadroom
+      - -config
+      - /var/lib/tsheadroom/config.json
+      - -v
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY:-}
+    volumes:
+      # Tailnet device identity. Must persist or the device re-authenticates as a new node.
+      - tsheadroom-state:/var/lib/tsheadroom
+      # HuggingFace ML model cache (~600 MB). Shared by all workers; survives restarts.
+      - tsheadroom-hf-cache:/root/.cache/huggingface
+    restart: unless-stopped
+
+volumes:
+  tsheadroom-state:
+  tsheadroom-hf-cache:
