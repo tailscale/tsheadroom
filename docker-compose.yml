@@ -16,7 +16,7 @@ services:
       - -state-dir
       - /var/lib/tsheadroom
       - -config
-      - /var/lib/tsheadroom/config.json
+      - /etc/tsheadroom/config.json
       - -v
     environment:
       TS_AUTHKEY: ${TS_AUTHKEY:-}
@@ -25,6 +25,11 @@ services:
       - tsheadroom-state:/var/lib/tsheadroom
       # HuggingFace ML model cache (~600 MB). Shared by all workers; survives restarts.
       - tsheadroom-hf-cache:/root/.cache/huggingface
+      # Compression knobs. A directory (not a single file) so the binary's atomic
+      # PUT /config write can rename within it; edit ./config/config.json on the
+      # host and restart, or use the PUT /config API. Seed it once:
+      #   mkdir -p config && cp tsheadroom.config.example.json config/config.json
+      - ./config:/etc/tsheadroom
     restart: unless-stopped
 
 volumes:
