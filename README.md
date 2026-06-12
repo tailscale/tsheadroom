@@ -58,7 +58,7 @@ For each request Aperture forwards, tsheadroom hands the `messages` array to `co
 
 - **Linux**, for the cloud hosts this is meant to run on. The binary also builds and runs on macOS, which is convenient for local development and testing.
 - **Go 1.26.4+** to build the binary (required by the pinned Tailscale dependency).
-- **Python with `headroom-ai` installed.** Use a version `headroom-ai` ships a prebuilt wheel for — Python 3.10–3.13 as of this writing. The newest Python release often has no wheel yet (3.14 at the time of writing), and pip then falls back to a Rust source build that fails. If unsure which versions are covered, check `Requires: Python` and the wheel filenames on [headroom-ai's PyPI page](https://pypi.org/project/headroom-ai/).
+- **Python 3.10 or newer with `headroom-ai` installed.** Since 0.25.0, `headroom-ai` ships a stable-ABI (abi3) wheel built for Python 3.10, so a single prebuilt wheel covers 3.10 and every newer release — 3.14 included — with no Rust toolchain needed. The source-build fallback now only happens *below* 3.10, or on a platform with no published wheel at all. If unsure, check `Requires: Python` and the wheel filenames on [headroom-ai's PyPI page](https://pypi.org/project/headroom-ai/).
 - **A Tailscale [auth key](https://tailscale.com/docs/features/access-control/auth-keys)** (`TS_AUTHKEY`) so the device can join your tailnet unattended. Generate one in the Tailscale admin console under **Settings** > **Keys**.
 
 ### Choose tool-output or text compression
@@ -87,15 +87,15 @@ Cross-compiling from a Mac for a Linux host:
 GOOS=linux GOARCH=amd64 go build -o build/tsheadroom .   # or GOARCH=arm64
 ```
 
-Set up the Python interpreter (a virtualenv is recommended). `headroom-ai` ships prebuilt wheels on supported Python versions, so no Rust toolchain is needed:
+Set up the Python interpreter (a virtualenv is recommended). `headroom-ai` ships a prebuilt abi3 wheel for Python 3.10+, so no Rust toolchain is needed:
 
 ```shell
-python3.13 -m venv /opt/tsheadroom/venv                   # a supported version, called explicitly (3.13 shown)
-/opt/tsheadroom/venv/bin/python --version                 # confirm it matches a version with a wheel
+python3.13 -m venv /opt/tsheadroom/venv                   # Python 3.10+, called explicitly (3.13 shown)
+/opt/tsheadroom/venv/bin/python --version                 # confirm it's 3.10 or newer
 /opt/tsheadroom/venv/bin/pip install 'headroom-ai[ml]'    # or just 'headroom-ai' for tool-output only
 ```
 
-Name the interpreter explicitly (`python3.13`, or whichever supported version you have) rather than using bare `python3`, which may resolve to a release too new to have a wheel — common on an up-to-date Homebrew or a pyenv default. A venv on an unsupported version makes the `pip install` fail trying to build `headroom-ai` from Rust source (see [Troubleshooting](#install-fails-building-headroom-ai)). If you do not have a supported interpreter, install one with `brew install python@3.13`, `pyenv install 3.13`, or your platform's package manager — substituting the version number for whatever `headroom-ai` currently ships wheels for.
+Name the interpreter explicitly (`python3.13`, or whichever 3.10+ version you have) rather than using bare `python3`, which on a long-term-stable distro can still resolve to a release **older** than 3.10 — below the abi3 wheel's floor, so the `pip install` falls back to building `headroom-ai` from Rust source (see [Troubleshooting](#install-fails-building-headroom-ai)). If your default `python3` is too old, install a newer one with `brew install python@3.13`, `pyenv install 3.13`, or your platform's package manager.
 
 Copy the worker script next to wherever you'll run the service:
 
@@ -107,22 +107,37 @@ You now have the three things tsheadroom needs at runtime: the binary, a Python 
 
 ### Install fails building headroom-ai
 
-If `pip install 'headroom-ai[ml]'` fails with `maturin failed` and an error like:
+If `pip install 'headroom-ai[ml]'` starts compiling from source — you'll see `Building wheel for headroom-ai`, a `maturin` invocation, or a PyO3 error like:
 
 ```
-error: the configured Python interpreter version (3.14) is newer than PyO3's maximum supported version (3.13)
+error: failed to build headroom-ai from source (maturin / PyO3)
 ```
 
-your virtualenv is on a Python release newer than `headroom-ai`'s latest published wheel (the exact versions in the message will change over time). With no matching wheel, pip tries to compile `headroom-ai` from Rust source and PyO3 rejects the build. Confirm the version with `/opt/tsheadroom/venv/bin/python --version`. To fix it, delete the venv and recreate it with a supported interpreter (3.13 shown here — use whatever [headroom-ai](https://pypi.org/project/headroom-ai/) currently ships a wheel for):
+instead of downloading a `.whl`, pip couldn't find a wheel compatible with your interpreter. Since 0.25.0 the abi3 wheel covers Python **3.10 and newer**, so the usual cause is an interpreter **older than 3.10** (some long-term-stable distros still default to 3.9 or earlier), or a platform/architecture with no published wheel. Confirm the version with `/opt/tsheadroom/venv/bin/python --version`. To fix it, delete the venv and recreate it on Python 3.10+ (3.13 shown):
 
 ```shell
 rm -rf /opt/tsheadroom/venv
 python3.13 -m venv /opt/tsheadroom/venv
-/opt/tsheadroom/venv/bin/python --version                 # confirm a supported version
+/opt/tsheadroom/venv/bin/python --version                 # confirm 3.10 or newer
 /opt/tsheadroom/venv/bin/pip install 'headroom-ai[ml]'
 ```
 
-A correct install downloads prebuilt `.whl` files (their names contain the Python tag, e.g. `cp313`); if you instead see `Building wheel for headroom-ai` or `maturin`, you are still on an unsupported Python version.
+A correct install downloads a prebuilt `.whl` (its name carries the abi3 tag, e.g. `cp310-abi3`); if you instead see `Building wheel for headroom-ai` or `maturin`, your interpreter still has no compatible wheel — most often it's older than 3.10.
+
+### HF_TOKEN (optional)
+
+`headroom-ai[ml]` downloads its compression model from the [HuggingFace Hub](https://huggingface.co) the first time a worker loads it. The models are public, so **no token is required** — but anonymous Hub requests are rate-limited *per IP*, and a pool of workers cold-starting together can trip that limit and stall or fail their first model download. Setting `HF_TOKEN` authenticates those requests and lifts the limit. Set one if you:
+
+- cold-start several workers at once, or run in CI / ephemeral hosts that re-download the model often;
+- want workers to keep auto-fetching the newest model after a `headroom-ai` upgrade. Without a token, tsheadroom runs already-cached workers offline (see [ML model loading](#ml-model-loading-and-timeouts)) and won't reach the Hub to pull a newer artifact.
+
+Getting one is free:
+
+1. Sign in at [huggingface.co](https://huggingface.co) and open **Settings → Access Tokens** ([direct link](https://huggingface.co/settings/tokens)).
+2. **New token** with the **Read** scope — enough to download public and gated models. Don't grant write; it's unnecessary privilege.
+3. Copy the `hf_…` value (shown only once) into tsheadroom's environment — e.g. `Environment=HF_TOKEN=hf_…` in the systemd unit, or `HF_TOKEN=hf_…` in `.env`. The Go parent passes its environment through to every worker, so that's all the workers need.
+
+`HF_TOKEN` is a credential: keep it out of git, scope it to read, and rotate it from that same page if it leaks (revocation is instant). Sanity-check a token with `pip install huggingface_hub` and `HF_TOKEN=hf_… hf auth whoami`, which should print your username.
 
 ## Run
 
@@ -137,7 +152,7 @@ TS_AUTHKEY=tskey-auth-xxxx ./build/tsheadroom \
 
 This joins the tailnet as `tsheadroom` and listens for hook calls on `:80` at path `/`. Other tailnet devices (including Aperture) reach it at `http://tsheadroom.<your-tailnet>.ts.net/` (find `<your-tailnet>`, your [tailnet name](https://tailscale.com/kb/1217/tailnet-name), in the Tailscale admin console).
 
-> **First run on a fresh host**: with `[ml]` installed, the workers load (and on a brand-new host, download ~600 MB of model from HuggingFace) at startup. The very first compression request can block for up to ~60s while that happens; after that, requests are milliseconds. To avoid a slow cold start in production, warm the cache once before serving traffic, or set `HF_TOKEN` (see [ML model loading](#ml-model-loading-and-timeouts)).
+> **First run on a fresh host**: with `[ml]` installed, the workers load (and on a brand-new host, download ~600 MB of model from HuggingFace) at startup. The very first compression request can block for up to ~60s while that happens; after that, requests are milliseconds. To avoid a slow cold start in production, warm the cache once before serving traffic, or set `HF_TOKEN` (see [HF_TOKEN](#hf_token-optional)).
 
 `TS_AUTHKEY` is only needed on first start. Once `-state-dir` is populated you can omit it on restarts.
 
@@ -472,7 +487,7 @@ The ML text compressor loads a ~600 MB model on first use (one-time, then cached
 
 The result: a cold worker pays at most one slow (or, behind Aperture's timeout, uncompressed `allow`) request while the model loads, then it works, with no restart needed. To avoid even that, workers preload the model at startup whenever the persisted configuration could route content through the ML compressor. With `headroom-ai[ml]` installed this is the default: `compress_system_messages` is on and Headroom uses the ML model as its fallback for tool/mixed content, so it's needed under ordinary traffic, and workers come up warm. (Each preloaded worker holds its own resident copy of the model, which is why `-pool-size` defaults low.)
 
-The model downloads from HuggingFace on first ever use (cached under `~/.cache/huggingface` thereafter). transformers revalidates that cache against the Hub on each cold load; tsheadroom skips that network round-trip (and its anonymous rate-limiting) by running workers offline once the model is cached (`HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE`, set automatically; your own values are respected). To stay online with higher rate limits (for example, to let a fresh host download the model), set `HF_TOKEN` in the environment; it takes precedence over the automatic offline mode. A worker has ~60s to report ready, so a slow *cold* download on a fresh host can exceed that and make workers retry: warm the cache once (start a worker with the cache empty, or run a single `compress` under the worker's interpreter) before serving production traffic.
+The model downloads from HuggingFace on first ever use (cached under `~/.cache/huggingface` thereafter). transformers revalidates that cache against the Hub on each cold load; tsheadroom skips that network round-trip (and its anonymous rate-limiting) by running workers offline once the model is cached (`HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE`, set automatically; your own values are respected). To stay online with higher rate limits (for example, to let a fresh host download the model), set `HF_TOKEN` in the environment (see [HF_TOKEN](#hf_token-optional)); it takes precedence over the automatic offline mode. A worker has ~60s to report ready, so a slow *cold* download on a fresh host can exceed that and make workers retry: warm the cache once (start a worker with the cache empty, or run a single `compress` under the worker's interpreter) before serving production traffic.
 
 ## What gets compressed
 
