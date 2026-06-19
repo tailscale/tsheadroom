@@ -148,7 +148,10 @@ func (h *Handler) process(r *http.Request) (guardrailResponse, summary) {
 
 	// request_body must be a JSON object so we can splice messages back and
 	// return the whole thing (aperture rejects non-object modified bodies).
-	var reqBody map[string]any
+	// Parse only the top level — values stay as raw bytes, so untouched fields
+	// (system, tools, ...) pass through verbatim and are never re-marshaled, and
+	// the original messages length is free (no marshal just to size it).
+	var reqBody map[string]json.RawMessage
 	if err := json.Unmarshal(data.RequestBody, &reqBody); err != nil {
 		return allow, summary{reason: "allow(passthrough)", provider: data.Metadata.Provider, model: data.Metadata.Model}
 	}
@@ -159,23 +162,25 @@ func (h *Handler) process(r *http.Request) (guardrailResponse, summary) {
 	if !ok {
 		return allow, summary{reason: "allow(passthrough)", provider: data.Metadata.Provider, model: data.Metadata.Model}
 	}
-	messages, ok := rawMessages.([]any)
-	if !ok {
+	var messages []any
+	if err := json.Unmarshal(rawMessages, &messages); err != nil {
 		return allow, summary{reason: "allow(passthrough)", provider: data.Metadata.Provider, model: data.Metadata.Model}
 	}
 	// Prefer aperture's resolved metadata.model (always present, authoritative);
 	// fall back to the request body's own model field. Empty -> worker default.
 	model := data.Metadata.Model
 	if model == "" {
-		model, _ = reqBody["model"].(string)
+		if raw, ok := reqBody["model"]; ok {
+			_ = json.Unmarshal(raw, &model)
+		}
 	}
 
-	// Byte sizes are only used for the -v summary; skip the marshal otherwise
-	// (messages can be multi-MB). The message count is cheap, so keep it.
-	// For an allow result, output size equals input size (body unchanged).
+	// Byte sizes are only used for the -v summary. in_bytes is the original
+	// messages length, taken for free from the raw bytes we already hold. For an
+	// allow result, output size equals input size (body unchanged).
 	s := summary{inMessages: len(messages), provider: data.Metadata.Provider, model: model}
 	if h.verbose {
-		s.inBytes = jsonLen(messages)
+		s.inBytes = len(rawMessages)
 		s.outBytes = s.inBytes
 	}
 
@@ -212,23 +217,24 @@ func (h *Handler) process(r *http.Request) (guardrailResponse, summary) {
 	}
 
 	// Modify: replace only messages; system, tools, and every other top-level
-	// field pass through unchanged. Headroom compresses tool_use/tool_result
-	// content inside messages, so tool calls are already covered here.
-	reqBody["messages"] = res.Messages
+	// field pass through unchanged (as their original raw bytes). Headroom
+	// compresses tool_use/tool_result content inside messages, so tool calls are
+	// already covered here. We marshal the compressed messages once — the result
+	// becomes the response body, and its length is out_bytes for free.
+	newMessages, err := json.Marshal(res.Messages)
+	if err != nil {
+		// Couldn't re-encode the compressed messages; fail open rather than
+		// emit a malformed body.
+		h.log.Warn("marshal compressed messages failed; allowing", "err", err)
+		s.reason = "allow(error)"
+		return allow, s
+	}
+	reqBody["messages"] = newMessages
 	if h.verbose {
-		s.outBytes = jsonLen(res.Messages)
+		s.outBytes = len(newMessages)
 	}
 	s.reason = "modify"
 	return guardrailResponse{Action: "modify", RequestBody: reqBody}, s
-}
-
-// jsonLen returns the serialized byte length of v, or 0 if it can't be marshaled.
-func jsonLen(v any) int {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return 0
-	}
-	return len(b)
 }
 
 // affinityKey returns a routing key that pins a conversation to one worker so
