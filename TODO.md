@@ -1,5 +1,42 @@
 # TODO
 
+## Consider: stateful, delta-only workers (cut per-turn transfer cost)
+
+**Status:** idea / not scheduled. Captured from a perf discussion (June 2026).
+
+**Problem.** On a warm conversation the per-process compression cache makes
+*compute* nearly free (`worker_ms ≈ 60ms` — only the 2 new messages actually
+recompress), but every turn we still read, parse, ship, and re-encode the
+*entire growing conversation* across two boundaries (Aperture↔handler and
+handler↔worker). So warm-call latency tracks conversation **size**, not work
+done, and climbs as the session grows (observed ~1s and rising on a ~1.2 MB
+conversation, with `worker_ms` flat at ~60ms). The `json.RawMessage` passthrough
+(done) removed the redundant Go-side parse/marshal, but the dominant costs
+remain: the Aperture body read, the stdio pipe transfer, and the worker's
+`json.loads`/`json.dumps` of the full body — all unavoidable while we send the
+whole conversation each turn.
+
+**Idea.** Make the worker hold the parsed/compressed conversation per session and
+accept only the **delta** (new messages since last turn), returning only the
+newly compressed tail. Per-turn transfer + parse drops from O(conversation) to
+O(new messages).
+
+**Why it's a big change (hence: not now):**
+- The worker becomes **stateful and session-pinned** — affinity stops being a
+  warm-cache optimization and becomes load-bearing correctness (a turn *must*
+  reach the worker holding its prior state, or we fall back to a full resend).
+- Needs cache lifecycle: per-session eviction/TTL, memory bounds, and a clean
+  full-resync path when a worker is recycled, spills to another slot, or the
+  client's prior-prefix doesn't match (edits, retries, branch/rewind).
+- Protocol grows: send "base version + appended messages," handle resync.
+- Overlaps heavily with the proxy-wrap rethink below (the proxy already keeps
+  per-session state via CCR/prefix-cache) — if we go that direction, this comes
+  with it rather than being built separately here.
+
+**Cheaper interim levers if warm-call latency bites before then:** raise
+`-pool-size` / add real queueing+backpressure; or revisit whether the full body
+must cross the Aperture boundary each call.
+
 ## Consider: workers wrap the headroom *proxy* (`/v1/compress`) instead of calling `compress()`
 
 **Status:** idea / not scheduled. Captured from a design discussion (June 2026).
