@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -272,5 +273,61 @@ func TestAffinityKey(t *testing.T) {
 	// No messages and no session_id -> empty (pool falls back to shared dispatch).
 	if got := affinityKey("", nil); got != "" {
 		t.Errorf("empty input: got %q, want empty", got)
+	}
+}
+
+func TestHandler_GzipResponse(t *testing.T) {
+	makeH := func(gzipOn bool) *Handler {
+		h := newTestHandler(func(_ context.Context, _ compressRequest) (*compressResult, error) {
+			return &compressResult{Messages: json.RawMessage(`[{"role":"user","content":"small"}]`), TokensSaved: 5}, nil
+		})
+		h.gzipResponse = gzipOn
+		return h
+	}
+	body := `{"request_body":{"model":"gpt-4o","messages":[{"role":"user","content":"big"}]}}`
+
+	post := func(h *Handler, acceptGzip bool) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+		if acceptGzip {
+			req.Header.Set("Accept-Encoding", "gzip")
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+		return rec
+	}
+
+	// Enabled + client advertises gzip -> compressed; decompresses to modify.
+	rec := post(makeH(true), true)
+	if got := rec.Header().Get("Content-Encoding"); got != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip", got)
+	}
+	gz, err := gzip.NewReader(bytes.NewReader(rec.Body.Bytes()))
+	if err != nil {
+		t.Fatalf("gzip reader: %v", err)
+	}
+	var resp guardrailResponse
+	if err := json.NewDecoder(gz).Decode(&resp); err != nil {
+		t.Fatalf("decode gzipped body: %v", err)
+	}
+	if resp.Action != "modify" {
+		t.Errorf("gzipped action = %q, want modify", resp.Action)
+	}
+
+	// Enabled but client doesn't advertise gzip -> plain JSON.
+	rec = post(makeH(true), false)
+	if got := rec.Header().Get("Content-Encoding"); got != "" {
+		t.Errorf("Content-Encoding = %q, want empty when client didn't accept gzip", got)
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode plain body: %v", err)
+	}
+
+	// Disabled flag overrides Accept-Encoding -> plain JSON.
+	rec = post(makeH(false), true)
+	if got := rec.Header().Get("Content-Encoding"); got != "" {
+		t.Errorf("Content-Encoding = %q, want empty when gzip disabled", got)
 	}
 }

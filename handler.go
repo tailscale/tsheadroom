@@ -4,6 +4,8 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -12,6 +14,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -86,6 +89,14 @@ type Handler struct {
 
 	verbose bool      // when set, emit a per-request summary to out
 	out     io.Writer // destination for verbose summaries (stdout)
+
+	// gzipResponse, when set, gzips the modify/allow response if the caller
+	// advertised Accept-Encoding: gzip. aperture's tsnet hook client uses a
+	// standard http.Transport, which adds that header and transparently
+	// decompresses the reply, so this needs no aperture-side change. Only the
+	// response is compressed — the larger request body the hook receives arrives
+	// uncompressed (aperture has no faculty to compress it).
+	gzipResponse bool
 }
 
 // summary holds the numbers reported in the -v per-request line and folded into
@@ -136,7 +147,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Write the response back to aperture — the other half of the transfer cost.
 	writeStart := time.Now()
-	writeJSON(w, http.StatusOK, resp)
+	h.writeHookResponse(w, r, resp)
 	writeMs := msSince(writeStart)
 
 	durMs := msSince(start) // total: read + process + write
@@ -155,6 +166,41 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // msSince returns milliseconds elapsed since t, with microsecond resolution.
 func msSince(t time.Time) float64 {
 	return float64(time.Since(t).Microseconds()) / 1000
+}
+
+// writeHookResponse writes the guardrail response as JSON, gzipping it when
+// enabled and the caller advertised gzip. The compressed bytes are built in a
+// buffer first so a (vanishingly unlikely) encode error falls back to a plain
+// response with nothing half-written. Always HTTP 200 — the action is in the body.
+func (h *Handler) writeHookResponse(w http.ResponseWriter, r *http.Request, resp guardrailResponse) {
+	w.Header().Set("Content-Type", "application/json")
+	if h.gzipResponse && acceptsGzip(r) {
+		var buf bytes.Buffer
+		gz := gzip.NewWriter(&buf)
+		encErr := json.NewEncoder(gz).Encode(resp)
+		closeErr := gz.Close()
+		if encErr == nil && closeErr == nil {
+			w.Header().Set("Content-Encoding", "gzip")
+			w.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(buf.Bytes())
+			return
+		}
+		h.log.Warn("gzip response failed; sending uncompressed", "enc_err", encErr, "close_err", closeErr)
+	}
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// acceptsGzip reports whether the request's Accept-Encoding lists gzip.
+func acceptsGzip(r *http.Request) bool {
+	for _, enc := range strings.Split(r.Header.Get("Accept-Encoding"), ",") {
+		// Strip any q-value (e.g. "gzip;q=0.8") before comparing.
+		if strings.EqualFold(strings.TrimSpace(strings.SplitN(enc, ";", 2)[0]), "gzip") {
+			return true
+		}
+	}
+	return false
 }
 
 // process runs compression on an already-read hook body and returns the
