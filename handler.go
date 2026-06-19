@@ -139,12 +139,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 	writeMs := msSince(writeStart)
 
-	durMs := msSince(start)        // total: read + process + write
-	transferMs := readMs + writeMs // time spent moving bytes to/from aperture
+	durMs := msSince(start) // total: read + process + write
 
+	// read_ms (aperture -> us) and write_ms (us -> aperture) are the transfer
+	// cost, split so a large gap localizes to the inbound or outbound side
+	// (e.g. write_ms dominating points at back-pressure while aperture drains
+	// our response). dur_ms - read_ms - write_ms - worker_ms is Go/IPC overhead.
 	if h.verbose {
-		fmt.Fprintf(h.out, "request in_msgs=%d in_bytes=%d out_bytes=%d dur_ms=%.0f transfer_ms=%.0f worker_ms=%.0f slot=%d cold=%t model_limit=%d -> %s\n",
-			s.inMessages, s.inBytes, s.outBytes, durMs, transferMs, s.workerMs, s.slot, s.cold, s.modelLimit, s.reason)
+		fmt.Fprintf(h.out, "request in_msgs=%d in_bytes=%d out_bytes=%d dur_ms=%.0f read_ms=%.0f write_ms=%.0f worker_ms=%.0f slot=%d cold=%t model_limit=%d -> %s\n",
+			s.inMessages, s.inBytes, s.outBytes, durMs, readMs, writeMs, s.workerMs, s.slot, s.cold, s.modelLimit, s.reason)
 	}
 	h.metrics.record(s, durMs)
 }

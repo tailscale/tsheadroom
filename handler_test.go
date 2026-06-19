@@ -174,7 +174,7 @@ func TestHandler_VerboseSummary(t *testing.T) {
 	doHook(t, h, `{"request_body":{"model":"gpt-4o","messages":[{"role":"user","content":"big"}]}}`)
 
 	line := buf.String()
-	for _, want := range []string{"in_msgs=1", "in_bytes=", "out_bytes=", "dur_ms=", "transfer_ms=", "worker_ms=", "slot=", "-> modify"} {
+	for _, want := range []string{"in_msgs=1", "in_bytes=", "out_bytes=", "dur_ms=", "read_ms=", "write_ms=", "worker_ms=", "slot=", "-> modify"} {
 		if !strings.Contains(line, want) {
 			t.Errorf("verbose line %q missing %q", line, want)
 		}
