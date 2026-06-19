@@ -230,6 +230,8 @@ git pull && docker compose up -d --build
 | `-local-addr` | off | Serve plain HTTP here instead of tsnet, for local testing only. |
 | `-v` | off | Log a one-line per-request summary to stdout. See [Verify](#verify-its-working). |
 | `-no-affinity` | off | Disable session-affinity worker routing; dispatch every request to any free worker. See [Worker affinity](#worker-affinity). |
+| `-gzip-response` | on | Gzip the hook response when the caller sends `Accept-Encoding: gzip`. Aperture's tsnet client advertises and decompresses gzip transparently, so this needs no Aperture-side change. |
+| `-accept-compressed` | on | Advertise `Accept-Encoding: zstd, gzip` on responses so Aperture compresses the request bodies it sends us ([RFC 7694](https://www.rfc-editor.org/rfc/rfc7694)), cutting the inbound transfer that dominates warm-call latency. Inbound bodies are decoded regardless of this flag; it only gates whether we advertise the capability. Requires Aperture-side support to take effect. |
 
 > **State (`-state-dir`)**: must be a stable, writable, persistent path. It contains `tailscaled.state`, the device's private key. Treat it as a secret and keep it on durable storage, or the device re-authenticates as a *new* device on every restart.
 >
@@ -351,16 +353,21 @@ PY
 The proof is in the `-v` log line. Cold first request, then warm:
 
 ```
-request in_msgs=4 in_bytes=47227 out_bytes=24885 dur_ms=56956 worker_ms=42 cold=true  model_limit=200000 -> modify
-request in_msgs=4 in_bytes=47227 out_bytes=24885 dur_ms=12    worker_ms=11 cold=false model_limit=200000 -> modify
+request in_msgs=4 in_bytes=47227 out_bytes=24885 wire_bytes=47227 dur_ms=56956 read_ms=8 write_ms=3 worker_ms=42 slot=0 cold=true  model_limit=200000 -> modify
+request in_msgs=4 in_bytes=47227 out_bytes=24885 wire_bytes=47227 dur_ms=12    read_ms=2 write_ms=1 worker_ms=11 slot=0 cold=false model_limit=200000 -> modify
+request(zstd) in_msgs=4 in_bytes=47227 out_bytes=24885 wire_bytes=18044 dur_ms=10 read_ms=1 write_ms=1 worker_ms=8 slot=0 cold=false model_limit=200000 -> modify
 ```
 
 | Field | Meaning |
 |---|---|
-| `in_bytes` / `out_bytes` | Request body size before/after. `out_bytes < in_bytes` on a `modify` is compression happening. |
+| `request(<enc>)` | The body arrived compressed with `<enc>` (e.g. `request(zstd)`). Plain `request` means it arrived uncompressed. See [`-accept-compressed`](#flags). |
+| `in_bytes` / `out_bytes` | Messages size before/after compression. `out_bytes < in_bytes` on a `modify` is compression happening. |
+| `wire_bytes` | Bytes actually read off the wire. `wire_bytes < in_bytes` means Aperture sent the body compressed — the inbound transfer (and `read_ms`) shrinks accordingly. |
 | `dur_ms` / `worker_ms` | Total handler time / time inside the Python worker. A large gap with `cold=true` is the one-time model load. |
+| `read_ms` / `write_ms` | Time reading the request from Aperture / writing the response back — the transfer cost, split by direction. |
+| `slot` | Which worker served the request (`-1` when none ran, e.g. a passthrough `allow`). |
 | `cold=true` | This request paid the model load. Expect it once per worker. |
-| `-> modify` / `-> allow(...)` | The action returned, with a reason (`modify`, `allow(noop)`, `allow(error)`, `allow(passthrough)`, `allow(read-error)`). |
+| `-> modify` / `-> allow(...)` | The action returned, with a reason (`modify`, `allow(noop)`, `allow(error)`, `allow(passthrough)`, `allow(read-error)`, `allow(decode-error)`, `reject(encoding)`). |
 
 Confirm the inverse too. A short chat returns `allow`:
 
