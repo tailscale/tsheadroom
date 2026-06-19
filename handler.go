@@ -160,7 +160,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case readErr != nil:
 		h.log.Warn("read request body failed; allowing", "err", readErr)
-		resp, s = guardrailResponse{Action: "allow"}, summary{reason: "allow(read-error)", slot: -1}
+		resp, s = guardrailResponse{Action: "allow"}, summary{reason: "allow(read-error)", wireBytes: len(body), slot: -1}
 	default:
 		// Decompress an inbound compressed body (RFC 7694). The Content-Encoding
 		// is purely between aperture and us: on allow, aperture forwards its own
@@ -168,30 +168,33 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// user's request.
 		wireBytes := len(body)
 		enc := r.Header.Get("Content-Encoding")
-		decoded, decErr := decodeRequestBody(body, enc)
+		decoded, coding, decErr := decodeRequestBody(body, enc)
 		switch {
 		case errors.Is(decErr, errUnsupportedEncoding):
 			// We advertised a set aperture no longer matches (e.g. we dropped a
 			// coding between calls). Reject with 415 + Accept-Encoding so it
 			// downgrades to a coding we accept (or identity) and retries. This
 			// is a cooperative downgrade signal, not a block: aperture proceeds
-			// with the user's request uncompressed.
+			// with the user's request uncompressed. Advertise unconditionally
+			// here (even when -accept-compressed is off): a 415 that rejects a
+			// coding is useless to the client without saying what we do accept.
 			h.log.Warn("rejecting unsupported request content-encoding", "encoding", enc)
+			w.Header().Set("Accept-Encoding", acceptEncoding)
 			http.Error(w, "unsupported content-encoding", http.StatusUnsupportedMediaType)
-			s = summary{reason: "reject(encoding)", enc: enc, wireBytes: wireBytes, slot: -1}
+			s = summary{reason: "reject(encoding)", enc: coding, wireBytes: wireBytes, slot: -1}
 			if h.verbose {
 				fmt.Fprintf(h.out, "%s wire_bytes=%d read_ms=%.0f -> %s\n",
-					reqLabel(decodeName(enc)), wireBytes, readMs, s.reason)
+					reqLabel(coding), wireBytes, readMs, s.reason)
 			}
 			h.metrics.record(s, msSince(start))
 			return
 		case decErr != nil:
 			// Supported coding but the body won't decode (corruption): fail open.
 			h.log.Warn("decode request body failed; allowing", "encoding", enc, "err", decErr)
-			resp, s = guardrailResponse{Action: "allow"}, summary{reason: "allow(decode-error)", enc: enc, wireBytes: wireBytes, slot: -1}
+			resp, s = guardrailResponse{Action: "allow"}, summary{reason: "allow(decode-error)", enc: coding, wireBytes: wireBytes, slot: -1}
 		default:
 			resp, s = h.process(r.Context(), decoded)
-			s.enc = decodeName(enc)
+			s.enc = coding
 			s.wireBytes = wireBytes
 		}
 	}
@@ -225,16 +228,6 @@ func reqLabel(enc string) string {
 		return "request"
 	}
 	return "request(" + enc + ")"
-}
-
-// decodeName normalizes a Content-Encoding header value to the bare coding
-// token we matched on (lowercased, q-value stripped), for the -v summary.
-func decodeName(encoding string) string {
-	enc := strings.ToLower(strings.TrimSpace(strings.SplitN(encoding, ";", 2)[0]))
-	if enc == "identity" {
-		return ""
-	}
-	return enc
 }
 
 // msSince returns milliseconds elapsed since t, with microsecond resolution.

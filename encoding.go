@@ -70,23 +70,37 @@ var sharedZstdDecoder = func() *zstd.Decoder {
 	return d
 }()
 
-// decodeRequestBody decompresses body according to a request's Content-Encoding
-// header value. An empty or "identity" encoding returns body unchanged. An
-// encoding we don't advertise returns errUnsupportedEncoding (handler -> 415).
-// A decode failure on a supported coding returns a wrapped error (handler fails
-// open). Matching is case-insensitive; any q-value is ignored (request
-// Content-Encoding carries none in practice, but be lenient).
-func decodeRequestBody(body []byte, encoding string) ([]byte, error) {
+// normalizeCoding lowercases a Content-Encoding token and strips any q-value,
+// returning "" for an empty or "identity" coding (nothing to decode). It is the
+// single place the wire encoding name is parsed, so the decode dispatch and the
+// -v summary label agree.
+func normalizeCoding(encoding string) string {
 	enc := strings.ToLower(strings.TrimSpace(strings.SplitN(encoding, ";", 2)[0]))
-	if enc == "" || enc == "identity" {
-		return body, nil
+	if enc == "identity" {
+		return ""
+	}
+	return enc
+}
+
+// decodeRequestBody decompresses body according to a request's Content-Encoding
+// header value, returning the decoded body and the normalized coding name it
+// matched on. An empty or "identity" encoding returns body unchanged with an
+// empty coding. An encoding we don't advertise returns errUnsupportedEncoding
+// (handler -> 415); a decode failure on a supported coding returns a wrapped
+// error (handler fails open). The coding is returned on every path so callers
+// label the -v line without re-parsing the header.
+func decodeRequestBody(body []byte, encoding string) (decoded []byte, coding string, err error) {
+	coding = normalizeCoding(encoding)
+	if coding == "" {
+		return body, "", nil
 	}
 	for _, c := range reqCodecs {
-		if c.name == enc {
-			return c.decode(body)
+		if c.name == coding {
+			out, decErr := c.decode(body)
+			return out, coding, decErr
 		}
 	}
-	return nil, fmt.Errorf("%w: %q", errUnsupportedEncoding, enc)
+	return nil, coding, fmt.Errorf("%w: %q", errUnsupportedEncoding, coding)
 }
 
 func decodeZstd(body []byte) ([]byte, error) {

@@ -489,4 +489,21 @@ func TestHandler_InboundDecode(t *testing.T) {
 			t.Errorf("action = %q, want modify (decode independent of advertise flag)", resp.Action)
 		}
 	})
+
+	// A 415 rejection must always say what we accept, even with advertising off,
+	// or the client can't recover.
+	t.Run("415 advertises even when flag off", func(t *testing.T) {
+		h := newTestHandler(func(context.Context, compressRequest) (*compressResult, error) {
+			t.Error("compressor must not be called on a rejected encoding")
+			return nil, nil
+		})
+		h.acceptCompressed = false
+		rec := post(h, "br", []byte("whatever"))
+		if rec.Code != http.StatusUnsupportedMediaType {
+			t.Fatalf("status = %d, want 415", rec.Code)
+		}
+		if got := rec.Header().Get("Accept-Encoding"); got != acceptEncoding {
+			t.Errorf("415 Accept-Encoding = %q, want %q even with advertising disabled", got, acceptEncoding)
+		}
+	})
 }
