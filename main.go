@@ -42,6 +42,7 @@ func main() {
 		verbose     = flag.Bool("v", false, "log a per-request summary (in/out sizes, modify/allow) to stdout")
 		noAffinity  = flag.Bool("no-affinity", false, "disable session-affinity worker routing (dispatch every request to any free worker)")
 		gzipResp    = flag.Bool("gzip-response", true, "gzip the hook response when the caller sends Accept-Encoding: gzip (aperture's tsnet client decompresses transparently)")
+		acceptComp  = flag.Bool("accept-compressed", true, "advertise Accept-Encoding (zstd, gzip) so aperture compresses the request bodies it sends us (RFC 7694); inbound bodies are decoded regardless")
 	)
 	flag.Parse()
 
@@ -74,13 +75,14 @@ func main() {
 	metrics.affinityStats = pool.affinityStats
 
 	handler := &Handler{
-		comp:         pool,
-		settings:     settings,
-		log:          log,
-		metrics:      metrics,
-		verbose:      *verbose,
-		out:          os.Stdout,
-		gzipResponse: *gzipResp,
+		comp:             pool,
+		settings:         settings,
+		log:              log,
+		metrics:          metrics,
+		verbose:          *verbose,
+		out:              os.Stdout,
+		gzipResponse:     *gzipResp,
+		acceptCompressed: *acceptComp,
 	}
 
 	// /config is the runtime tuning API; /metrics is the Prometheus scrape
