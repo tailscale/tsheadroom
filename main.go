@@ -41,6 +41,7 @@ func main() {
 		localAddr   = flag.String("local-addr", "", "if set, serve plain HTTP here instead of tsnet (for local testing)")
 		verbose     = flag.Bool("v", false, "log a per-request summary (in/out sizes, modify/allow) to stdout")
 		noAffinity  = flag.Bool("no-affinity", false, "disable session-affinity worker routing (dispatch every request to any free worker)")
+		gzipResp    = flag.Bool("gzip-response", true, "gzip the hook response when the caller sends Accept-Encoding: gzip (aperture's tsnet client decompresses transparently)")
 	)
 	flag.Parse()
 
@@ -73,18 +74,19 @@ func main() {
 	metrics.affinityStats = pool.affinityStats
 
 	handler := &Handler{
-		comp:     pool,
-		settings: settings,
-		log:      log,
-		metrics:  metrics,
-		verbose:  *verbose,
-		out:      os.Stdout,
+		comp:         pool,
+		settings:     settings,
+		log:          log,
+		metrics:      metrics,
+		verbose:      *verbose,
+		out:          os.Stdout,
+		gzipResponse: *gzipResp,
 	}
 
 	// /config is the runtime tuning API; /metrics is the Prometheus scrape
 	// endpoint; everything else is the aperture hook.
 	mux := http.NewServeMux()
-	mux.Handle("/config", &configHandler{store: settings, log: log})
+	mux.Handle("/config", &configHandler{store: settings, log: log, headroomVersion: pool.headroomVersion})
 	mux.Handle("/metrics", metrics)
 	mux.Handle("/", handler)
 	httpSrv := &http.Server{Handler: mux}

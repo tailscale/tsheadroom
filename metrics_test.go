@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -155,7 +156,7 @@ func TestMetrics_HandlerIntegration(t *testing.T) {
 		if req.Model != "claude-from-metadata" {
 			t.Errorf("compress model = %q, want metadata model", req.Model)
 		}
-		return &compressResult{Messages: []any{"x"}, TokensBefore: 50, TokensSaved: 20, TokensAfter: 30}, nil
+		return &compressResult{Messages: json.RawMessage(`["x"]`), TokensBefore: 50, TokensSaved: 20, TokensAfter: 30}, nil
 	})
 	h.metrics = newMetrics()
 

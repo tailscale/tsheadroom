@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -24,7 +25,8 @@ import (
 //
 // TargetRatio and KompressModel are pointers because their "unset" value is
 // JSON null with real meaning (target_ratio null = "model decides ~15%";
-// kompress_model null = headroom's default model).
+// kompress_model null = headroom's default model). SavingsProfile is likewise a
+// pointer (null = no profile).
 type CompressSettings struct {
 	CompressUserMessages   bool     `json:"compress_user_messages"`
 	CompressSystemMessages bool     `json:"compress_system_messages"`
@@ -33,7 +35,17 @@ type CompressSettings struct {
 	TargetRatio            *float64 `json:"target_ratio"`
 	MinTokensToCompress    int      `json:"min_tokens_to_compress"`
 	KompressModel          *string  `json:"kompress_model"`
+
+	// SavingsProfile selects a headroom named profile (>= 0.26.0). When set it
+	// OVERRIDES the individual knobs above. null = no profile (default).
+	SavingsProfile *string `json:"savings_profile"`
 }
+
+// savingsProfiles is the set of named profiles headroom exposes via the library
+// compress() path. Validation rejects anything else so an unknown name can never
+// reach compress() — where it would raise (it's applied before compress()'s own
+// fail-open try) and make the pool recycle the worker on every request.
+var savingsProfiles = map[string]bool{"agent-90": true, "balanced": true}
 
 // defaultSettings mirrors headroom's CompressConfig defaults (compress.py).
 func defaultSettings() CompressSettings {
@@ -61,6 +73,9 @@ func (s CompressSettings) validate() error {
 	}
 	if s.KompressModel != nil && *s.KompressModel == "" {
 		return fmt.Errorf("kompress_model must be a non-empty string or null")
+	}
+	if s.SavingsProfile != nil && !savingsProfiles[*s.SavingsProfile] {
+		return fmt.Errorf("savings_profile must be one of agent-90, balanced, or null")
 	}
 	return nil
 }
@@ -183,11 +198,25 @@ func (st *settingsStore) save(s CompressSettings) error {
 }
 
 // configHandler serves the runtime tuning API: GET returns the current
-// settings; PUT merges the provided fields onto the current settings (partial
-// updates allowed), validates, persists, and returns the result.
+// settings (plus the detected headroom_version); PUT merges the provided fields
+// onto the current settings (partial updates allowed), validates, persists, and
+// returns the result.
 type configHandler struct {
 	store *settingsStore
 	log   *slog.Logger
+
+	// headroomVersion reports the detected headroom-ai version and whether it's
+	// known yet. Used to surface the version on GET and to reject setting
+	// savings_profile on a version that predates it. nil in tests = unknown.
+	headroomVersion func() (string, bool)
+}
+
+// configView is the GET response: the settings plus the read-only detected
+// headroom version. Embedding flattens CompressSettings' fields, so
+// savings_profile stays visible even when the running headroom can't honor it.
+type configView struct {
+	CompressSettings
+	HeadroomVersion string `json:"headroom_version,omitempty"`
 }
 
 const maxConfigBody = 64 << 10
@@ -195,13 +224,28 @@ const maxConfigBody = 64 << 10
 func (h *configHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, h.store.get())
+		view := configView{CompressSettings: h.store.get()}
+		if h.headroomVersion != nil {
+			if ver, ok := h.headroomVersion(); ok {
+				view.HeadroomVersion = ver
+			}
+		}
+		writeJSON(w, http.StatusOK, view)
 
 	case http.MethodPut, http.MethodPost:
 		body, err := io.ReadAll(io.LimitReader(r.Body, maxConfigBody))
 		if err != nil {
 			http.Error(w, "read body failed", http.StatusBadRequest)
 			return
+		}
+		// Reject *setting* savings_profile on a headroom too old to honor it
+		// (where it would be a silent no-op), before we validate/persist.
+		// Clearing it (null) or leaving it untouched is always allowed.
+		if h.settingNonNullSavingsProfile(body) {
+			if ver, ok := h.detectedVersion(); ok && !supportsSavingsProfile(ver) {
+				http.Error(w, fmt.Sprintf("savings_profile requires headroom-ai >= 0.26.0 (detected %s)", ver), http.StatusBadRequest)
+				return
+			}
 		}
 		updated, err := h.store.merge(body)
 		if err != nil {
@@ -214,6 +258,27 @@ func (h *configHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// detectedVersion returns the detected headroom version and whether it's known,
+// nil-safe for tests that don't wire the accessor.
+func (h *configHandler) detectedVersion() (string, bool) {
+	if h.headroomVersion == nil {
+		return "", false
+	}
+	return h.headroomVersion()
+}
+
+// settingNonNullSavingsProfile reports whether the PUT body assigns
+// savings_profile a non-null value (i.e. is trying to turn it on). Absent key or
+// explicit null is not "setting" it.
+func (h *configHandler) settingNonNullSavingsProfile(body []byte) bool {
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(body, &probe); err != nil {
+		return false // malformed body; merge will reject it with a clearer error
+	}
+	raw, ok := probe["savings_profile"]
+	return ok && strings.TrimSpace(string(raw)) != "null"
 }
 
 // writeJSON writes v as a JSON response with the given status.

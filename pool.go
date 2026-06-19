@@ -14,6 +14,8 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -24,7 +26,10 @@ import (
 // Model is optional (the worker lets headroom pick a default when empty);
 // Config carries the runtime-tunable compress knobs.
 type compressRequest struct {
-	Messages []any            `json:"messages"`
+	// Messages is the raw JSON of the request's messages array, passed straight
+	// through to the worker without parsing into Go values and re-marshaling.
+	// json.RawMessage marshals verbatim, so the worker sees the original bytes.
+	Messages json.RawMessage  `json:"messages"`
 	Model    string           `json:"model,omitempty"`
 	Config   CompressSettings `json:"config"`
 
@@ -38,17 +43,23 @@ type compressRequest struct {
 // compressResult mirrors the fields worker.py projects from headroom's
 // CompressResult.
 type compressResult struct {
-	Messages          []any    `json:"messages"`
-	TokensBefore      int      `json:"tokens_before"`
-	TokensAfter       int      `json:"tokens_after"`
-	TokensSaved       int      `json:"tokens_saved"`
-	CompressionRatio  float64  `json:"compression_ratio"`
-	TransformsApplied []string `json:"transforms_applied"`
+	// Messages is the compressed messages array, kept as raw JSON so the handler
+	// can splice it back into the response body without parsing + re-marshaling.
+	Messages          json.RawMessage `json:"messages"`
+	TokensBefore      int             `json:"tokens_before"`
+	TokensAfter       int             `json:"tokens_after"`
+	TokensSaved       int             `json:"tokens_saved"`
+	CompressionRatio  float64         `json:"compression_ratio"`
+	TransformsApplied []string        `json:"transforms_applied"`
 
 	// Diagnostics added by worker.py (not part of headroom's CompressResult).
 	ElapsedMs     float64 `json:"elapsed_ms"`      // worker-side compress() wall time
 	ColdFirstCall bool    `json:"cold_first_call"` // this worker's first real request
 	ModelLimit    int     `json:"model_limit"`     // context-window limit compressed against
+
+	// Slot is the pool slot whose worker served this request. Stamped by the
+	// pool (runSlot), not sent by the worker (json:"-"); -1 when unknown.
+	Slot int `json:"-"`
 }
 
 // requestEnvelope / responseEnvelope are the NDJSON framing on the wire.
@@ -123,6 +134,11 @@ type Pool struct {
 	affinityHits   atomic.Int64 // jobs routed straight to their affinity slot
 	affinitySpills atomic.Int64 // affinity-eligible jobs whose slot was busy -> shared
 
+	// headroomVer holds the headroom-ai version reported by workers in their ready
+	// handshake (nil until the first worker reports). Workers all run the same
+	// interpreter, so any ready worker's value is authoritative; last-writer-wins.
+	headroomVer atomic.Pointer[string]
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -139,6 +155,24 @@ func (p *Pool) affinityStats() (hits, spills int64) {
 	return p.affinityHits.Load(), p.affinitySpills.Load()
 }
 
+// recordHeadroomVersion stores a version reported by a ready worker. Empty
+// strings (a worker that couldn't read its version) are ignored so they don't
+// clobber a good value reported by another worker.
+func (p *Pool) recordHeadroomVersion(ver string) {
+	if ver != "" {
+		p.headroomVer.Store(&ver)
+	}
+}
+
+// headroomVersion returns the headroom-ai version reported by workers, and
+// whether it is known yet (false before any worker has reported readiness).
+func (p *Pool) headroomVersion() (string, bool) {
+	if v := p.headroomVer.Load(); v != nil {
+		return *v, true
+	}
+	return "", false
+}
+
 // slotFor maps an affinity key to a slot index (stable for a given key/size).
 func slotFor(key string, size int) int {
 	if size <= 1 {
@@ -147,6 +181,23 @@ func slotFor(key string, size int) int {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(key))
 	return int(h.Sum32() % uint32(size))
+}
+
+// supportsSavingsProfile reports whether a headroom-ai version exposes the
+// CompressConfig.savings_profile knob (added in 0.26.0). An unparseable version
+// is treated as supported: better to allow the knob (the value is whitelisted
+// separately) than to wrongly block a current host over an odd version string.
+func supportsSavingsProfile(ver string) bool {
+	parts := strings.SplitN(ver, ".", 3)
+	if len(parts) < 2 {
+		return true
+	}
+	major, err1 := strconv.Atoi(parts[0])
+	minor, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil {
+		return true
+	}
+	return major > 0 || minor >= 26
 }
 
 // NewPool starts `size` slot goroutines, each spawning and supervising a worker
@@ -341,6 +392,9 @@ func (p *Pool) runSlot(idx int) {
 			p.log.Info("slow worker call", "slot", idx, "dur", dur,
 				"cold_first_call", res.ColdFirstCall, "worker_ms", res.ElapsedMs)
 		}
+		if res != nil {
+			res.Slot = idx // record which slot served this, for the -v line
+		}
 		j.resp <- jobResult{result: res, err: err}
 	}
 }
@@ -357,7 +411,8 @@ func (p *Pool) spawn(idx int) *worker {
 		}
 		w, err := startWorker(p.newCmd, idx, p.log)
 		if err == nil {
-			p.log.Info("worker ready", "slot", idx, "pid", w.cmd.Process.Pid)
+			p.recordHeadroomVersion(w.headroomVersion)
+			p.log.Info("worker ready", "slot", idx, "pid", w.cmd.Process.Pid, "headroom_version", w.headroomVersion)
 			return w
 		}
 		p.log.Error("worker spawn failed; retrying", "slot", idx, "err", err, "backoff", backoff)
@@ -381,6 +436,11 @@ type worker struct {
 	log    *slog.Logger
 	slot   int
 	nextID int
+
+	// headroomVersion is the worker's installed headroom-ai version, reported in
+	// its ready handshake ("" if the worker couldn't read it). The pool records
+	// it so the config API can gate version-specific knobs (see Pool.headroomVersion).
+	headroomVersion string
 }
 
 // startWorker builds a worker process from newCmd, wires stdio, streams stderr
@@ -475,11 +535,13 @@ func (w *worker) awaitReady() error {
 		return fmt.Errorf("reading ready line: %w", err)
 	}
 	var msg struct {
-		Ready bool `json:"ready"`
+		Ready           bool   `json:"ready"`
+		HeadroomVersion string `json:"headroom_version"`
 	}
 	if err := json.Unmarshal(line, &msg); err != nil || !msg.Ready {
 		return fmt.Errorf("unexpected first line from worker: %s", truncate(line))
 	}
+	w.headroomVersion = msg.HeadroomVersion
 	return nil
 }
 
