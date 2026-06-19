@@ -128,15 +128,21 @@ func mustCompress(t *testing.T, p *Pool, req compressRequest, timeout time.Durat
 
 func TestPool_RoundTrip(t *testing.T) {
 	p := testPool(t, 1)
-	res, err := mustCompress(t, p, compressRequest{Messages: []any{"a", "b"}, Model: "gpt-4o"}, 5*time.Second)
+	res, err := mustCompress(t, p, compressRequest{Messages: json.RawMessage(`["a","b"]`), Model: "gpt-4o"}, 5*time.Second)
 	if err != nil {
 		t.Fatalf("Compress: %v", err)
 	}
 	if res.TokensSaved != 60 {
 		t.Errorf("tokens_saved = %d, want 60", res.TokensSaved)
 	}
-	if len(res.Messages) != 2 {
-		t.Errorf("messages len = %d, want 2 (echoed)", len(res.Messages))
+	// The fake echoes the request messages back; res.Messages is raw JSON now,
+	// so parse it to confirm the round-trip preserved the 2-element array.
+	var got []any
+	if err := json.Unmarshal(res.Messages, &got); err != nil {
+		t.Fatalf("echoed messages not valid JSON: %v (%s)", err, res.Messages)
+	}
+	if len(got) != 2 {
+		t.Errorf("messages len = %d, want 2 (echoed)", len(got))
 	}
 }
 
@@ -150,7 +156,7 @@ func TestPool_NilResultIsError(t *testing.T) {
 		t.Fatalf("expected error and nil result, got res=%v err=%v", res, err)
 	}
 	// Pool recovers for the next request.
-	if _, err := mustCompress(t, p, compressRequest{Messages: []any{"x"}}, 5*time.Second); err != nil {
+	if _, err := mustCompress(t, p, compressRequest{Messages: json.RawMessage(`["x"]`)}, 5*time.Second); err != nil {
 		t.Fatalf("pool did not recover after nil-result: %v", err)
 	}
 }
@@ -162,7 +168,7 @@ func TestPool_IdMismatchIsError(t *testing.T) {
 	if _, err := mustCompress(t, p, compressRequest{Model: "WRONG_ID"}, 5*time.Second); err == nil {
 		t.Fatal("expected error on response id mismatch")
 	}
-	if _, err := mustCompress(t, p, compressRequest{Messages: []any{"x"}}, 5*time.Second); err != nil {
+	if _, err := mustCompress(t, p, compressRequest{Messages: json.RawMessage(`["x"]`)}, 5*time.Second); err != nil {
 		t.Fatalf("pool did not recover after id mismatch: %v", err)
 	}
 }
@@ -173,7 +179,7 @@ func TestPool_WorkerErrorFailsOpen(t *testing.T) {
 		t.Fatal("expected error from worker ok:false response")
 	}
 	// The slot should recycle and serve the next request normally.
-	if _, err := mustCompress(t, p, compressRequest{Messages: []any{"x"}}, 5*time.Second); err != nil {
+	if _, err := mustCompress(t, p, compressRequest{Messages: json.RawMessage(`["x"]`)}, 5*time.Second); err != nil {
 		t.Fatalf("pool did not recover after worker error: %v", err)
 	}
 }
@@ -183,7 +189,7 @@ func TestPool_CrashRecovery(t *testing.T) {
 	if _, err := mustCompress(t, p, compressRequest{Model: "CRASH"}, 5*time.Second); err == nil {
 		t.Fatal("expected error when worker crashes mid-request")
 	}
-	res, err := mustCompress(t, p, compressRequest{Messages: []any{"x"}}, 5*time.Second)
+	res, err := mustCompress(t, p, compressRequest{Messages: json.RawMessage(`["x"]`)}, 5*time.Second)
 	if err != nil {
 		t.Fatalf("pool did not recover after crash: %v", err)
 	}
@@ -205,7 +211,7 @@ func TestPool_SlowCallFailsOpenButWorkerWarms(t *testing.T) {
 	}
 
 	// The same worker should now be warm: a generous-deadline call succeeds.
-	res, err := mustCompress(t, p, compressRequest{Model: "SLOW_ONCE", Messages: []any{"x"}}, 5*time.Second)
+	res, err := mustCompress(t, p, compressRequest{Model: "SLOW_ONCE", Messages: json.RawMessage(`["x"]`)}, 5*time.Second)
 	if err != nil {
 		t.Fatalf("worker did not warm/recover after slow first call: %v", err)
 	}
@@ -225,7 +231,7 @@ func TestPool_HardCapRecyclesWedgedWorker(t *testing.T) {
 		t.Fatal("expected error when worker exceeds the hard cap")
 	}
 	// Fresh worker serves the next call.
-	if _, err := mustCompress(t, p, compressRequest{Messages: []any{"x"}}, 5*time.Second); err != nil {
+	if _, err := mustCompress(t, p, compressRequest{Messages: json.RawMessage(`["x"]`)}, 5*time.Second); err != nil {
 		t.Fatalf("pool did not recover after hard-cap recycle: %v", err)
 	}
 }
@@ -239,7 +245,7 @@ func TestPool_ConcurrentLoad(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, err := mustCompress(t, p, compressRequest{Messages: []any{"x"}}, 10*time.Second); err != nil {
+			if _, err := mustCompress(t, p, compressRequest{Messages: json.RawMessage(`["x"]`)}, 10*time.Second); err != nil {
 				errs <- err
 			}
 		}()
@@ -283,7 +289,7 @@ func TestStartWorker_ReadyTimeout(t *testing.T) {
 
 func TestPool_ShutdownIsPrompt(t *testing.T) {
 	p := newPool(2, helperCmd(), 30*time.Second, quietLog())
-	if _, err := mustCompress(t, p, compressRequest{Messages: []any{"x"}}, 5*time.Second); err != nil {
+	if _, err := mustCompress(t, p, compressRequest{Messages: json.RawMessage(`["x"]`)}, 5*time.Second); err != nil {
 		t.Fatalf("warmup compress: %v", err)
 	}
 	done := make(chan struct{})
@@ -337,7 +343,7 @@ func TestPool_AffinitySameKeySameWorker(t *testing.T) {
 	p := testPool(t, 4)
 	var pid string
 	for i := 0; i < 5; i++ {
-		res, err := mustCompress(t, p, compressRequest{Messages: []any{"x"}, AffinityKey: "conv-A"}, 5*time.Second)
+		res, err := mustCompress(t, p, compressRequest{Messages: json.RawMessage(`["x"]`), AffinityKey: "conv-A"}, 5*time.Second)
 		if err != nil {
 			t.Fatalf("request %d: %v", i, err)
 		}
@@ -367,7 +373,7 @@ func TestPool_AffinitySpillUnderContention(t *testing.T) {
 			defer wg.Done()
 			// SLEEP holds each slot ~400ms so the warm slot's buffer fills and
 			// the rest are forced to spill.
-			_, _ = mustCompress(t, p, compressRequest{Messages: []any{"x"}, Model: "SLEEP", AffinityKey: "conv-B"}, 10*time.Second)
+			_, _ = mustCompress(t, p, compressRequest{Messages: json.RawMessage(`["x"]`), Model: "SLEEP", AffinityKey: "conv-B"}, 10*time.Second)
 		}()
 	}
 	wg.Wait()
@@ -390,7 +396,7 @@ func TestPool_AffinityDisabledUsesShared(t *testing.T) {
 	p := testPool(t, 2)
 	p.affinityEnabled = false
 	for i := 0; i < 3; i++ {
-		if _, err := mustCompress(t, p, compressRequest{Messages: []any{"x"}, AffinityKey: "conv-C"}, 5*time.Second); err != nil {
+		if _, err := mustCompress(t, p, compressRequest{Messages: json.RawMessage(`["x"]`), AffinityKey: "conv-C"}, 5*time.Second); err != nil {
 			t.Fatalf("request %d: %v", i, err)
 		}
 	}
@@ -407,7 +413,7 @@ func TestPool_ShutdownAnswersBufferedAffinityJob(t *testing.T) {
 
 	// Occupy the single slot's worker with a long call on key "K".
 	go func() {
-		_, _ = mustCompress(t, p, compressRequest{Messages: []any{"x"}, Model: "HANG", AffinityKey: "K"}, 30*time.Second)
+		_, _ = mustCompress(t, p, compressRequest{Messages: json.RawMessage(`["x"]`), Model: "HANG", AffinityKey: "K"}, 30*time.Second)
 	}()
 	deadline := time.Now().Add(3 * time.Second)
 	for p.busy.Load() == 0 {
@@ -422,7 +428,7 @@ func TestPool_ShutdownAnswersBufferedAffinityJob(t *testing.T) {
 	// were orphaned, this would hang.
 	bufferedErr := make(chan error, 1)
 	go func() {
-		_, err := p.Compress(context.Background(), compressRequest{Messages: []any{"y"}, AffinityKey: "K"})
+		_, err := p.Compress(context.Background(), compressRequest{Messages: json.RawMessage(`["y"]`), AffinityKey: "K"})
 		bufferedErr <- err
 	}()
 	time.Sleep(50 * time.Millisecond) // let the buffered send land
@@ -458,7 +464,7 @@ func TestSupportsSavingsProfile(t *testing.T) {
 func TestPool_CapturesHeadroomVersion(t *testing.T) {
 	p := newPool(1, helperCmd("HELPER_HEADROOM_VERSION=0.26.0"), 30*time.Second, quietLog())
 	t.Cleanup(p.Shutdown)
-	if _, err := mustCompress(t, p, compressRequest{Messages: []any{"x"}}, 5*time.Second); err != nil {
+	if _, err := mustCompress(t, p, compressRequest{Messages: json.RawMessage(`["x"]`)}, 5*time.Second); err != nil {
 		t.Fatalf("warmup: %v", err)
 	}
 	if ver, ok := p.headroomVersion(); !ok || ver != "0.26.0" {
@@ -470,7 +476,7 @@ func TestPool_CapturesHeadroomVersion(t *testing.T) {
 // (an empty report must not clobber it to "").
 func TestPool_HeadroomVersionUnknownWhenWorkerSilent(t *testing.T) {
 	p := testPool(t, 1) // helperCmd() emits no version
-	if _, err := mustCompress(t, p, compressRequest{Messages: []any{"x"}}, 5*time.Second); err != nil {
+	if _, err := mustCompress(t, p, compressRequest{Messages: json.RawMessage(`["x"]`)}, 5*time.Second); err != nil {
 		t.Fatalf("warmup: %v", err)
 	}
 	if ver, ok := p.headroomVersion(); ok {

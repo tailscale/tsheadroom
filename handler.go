@@ -105,6 +105,7 @@ type summary struct {
 	workerMs   float64 // worker-reported compress() time (0 when no worker result)
 	cold       bool    // worker's first real request (paid the cold model load)
 	modelLimit int     // context-window limit the worker compressed against (0 when no result)
+	slot       int     // pool slot whose worker served this request (-1 when none ran)
 	reason     string  // why this action was chosen: modify / allow(noop|error|passthrough|read-error)
 }
 
@@ -118,53 +119,74 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	start := time.Now()
-	resp, s := h.process(r)
-	durMs := float64(time.Since(start).Microseconds()) / 1000
+
+	// Read the request body from aperture. Timed on its own: reading (and later
+	// writing) the body is pure transfer cost, separate from compression.
+	body, readErr := io.ReadAll(io.LimitReader(r.Body, maxBody))
+	readMs := msSince(start)
+
+	var resp guardrailResponse
+	var s summary
+	if readErr != nil {
+		h.log.Warn("read request body failed; allowing", "err", readErr)
+		resp, s = guardrailResponse{Action: "allow"}, summary{reason: "allow(read-error)", slot: -1}
+	} else {
+		resp, s = h.process(r.Context(), body)
+	}
+
+	// Write the response back to aperture — the other half of the transfer cost.
+	writeStart := time.Now()
+	writeJSON(w, http.StatusOK, resp)
+	writeMs := msSince(writeStart)
+
+	durMs := msSince(start)        // total: read + process + write
+	transferMs := readMs + writeMs // time spent moving bytes to/from aperture
 
 	if h.verbose {
-		fmt.Fprintf(h.out, "request in_msgs=%d in_bytes=%d out_bytes=%d dur_ms=%.0f worker_ms=%.0f cold=%t model_limit=%d -> %s\n",
-			s.inMessages, s.inBytes, s.outBytes, durMs, s.workerMs, s.cold, s.modelLimit, s.reason)
+		fmt.Fprintf(h.out, "request in_msgs=%d in_bytes=%d out_bytes=%d dur_ms=%.0f transfer_ms=%.0f worker_ms=%.0f slot=%d cold=%t model_limit=%d -> %s\n",
+			s.inMessages, s.inBytes, s.outBytes, durMs, transferMs, s.workerMs, s.slot, s.cold, s.modelLimit, s.reason)
 	}
 	h.metrics.record(s, durMs)
-	writeJSON(w, http.StatusOK, resp)
 }
 
-// process reads the hook call, runs compression, and returns the guardrail
-// response plus a summary for logging. Every failure path degrades to allow so
-// the handler can never break a user's request.
-func (h *Handler) process(r *http.Request) (guardrailResponse, summary) {
-	allow := guardrailResponse{Action: "allow"}
+// msSince returns milliseconds elapsed since t, with microsecond resolution.
+func msSince(t time.Time) float64 {
+	return float64(time.Since(t).Microseconds()) / 1000
+}
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody))
-	if err != nil {
-		h.log.Warn("read request body failed; allowing", "err", err)
-		return allow, summary{reason: "allow(read-error)"}
-	}
+// process runs compression on an already-read hook body and returns the
+// guardrail response plus a summary for logging. ctx bounds the compression
+// wait (aperture's hook timeout / client disconnect). Every failure path
+// degrades to allow so the handler can never break a user's request.
+func (h *Handler) process(ctx context.Context, body []byte) (guardrailResponse, summary) {
+	allow := guardrailResponse{Action: "allow"}
 
 	var data hookCallData
 	if err := json.Unmarshal(body, &data); err != nil || len(data.RequestBody) == 0 {
-		return allow, summary{reason: "allow(passthrough)"}
+		return allow, summary{reason: "allow(passthrough)", slot: -1}
 	}
 
 	// request_body must be a JSON object so we can splice messages back and
 	// return the whole thing (aperture rejects non-object modified bodies).
 	// Parse only the top level — values stay as raw bytes, so untouched fields
-	// (system, tools, ...) pass through verbatim and are never re-marshaled, and
-	// the original messages length is free (no marshal just to size it).
+	// (system, tools, ...) pass through verbatim and are never re-marshaled.
 	var reqBody map[string]json.RawMessage
 	if err := json.Unmarshal(data.RequestBody, &reqBody); err != nil {
-		return allow, summary{reason: "allow(passthrough)", provider: data.Metadata.Provider, model: data.Metadata.Model}
+		return allow, summary{reason: "allow(passthrough)", provider: data.Metadata.Provider, model: data.Metadata.Model, slot: -1}
 	}
 
 	// v1 handles only the `messages` shape (Anthropic/OpenAI). Anything else
-	// (e.g. Gemini's `contents`, embeddings) passes through untouched.
+	// (e.g. Gemini's `contents`, embeddings) passes through untouched. The
+	// top-level array is split into raw elements (a shallow parse that does not
+	// recurse into each message) — enough for the count and the affinity key,
+	// while the bytes pass to the worker unparsed.
 	rawMessages, ok := reqBody["messages"]
 	if !ok {
-		return allow, summary{reason: "allow(passthrough)", provider: data.Metadata.Provider, model: data.Metadata.Model}
+		return allow, summary{reason: "allow(passthrough)", provider: data.Metadata.Provider, model: data.Metadata.Model, slot: -1}
 	}
-	var messages []any
-	if err := json.Unmarshal(rawMessages, &messages); err != nil {
-		return allow, summary{reason: "allow(passthrough)", provider: data.Metadata.Provider, model: data.Metadata.Model}
+	var msgs []json.RawMessage
+	if err := json.Unmarshal(rawMessages, &msgs); err != nil {
+		return allow, summary{reason: "allow(passthrough)", provider: data.Metadata.Provider, model: data.Metadata.Model, slot: -1}
 	}
 	// Prefer aperture's resolved metadata.model (always present, authoritative);
 	// fall back to the request body's own model field. Empty -> worker default.
@@ -176,9 +198,8 @@ func (h *Handler) process(r *http.Request) (guardrailResponse, summary) {
 	}
 
 	// Byte sizes are only used for the -v summary. in_bytes is the original
-	// messages length, taken for free from the raw bytes we already hold. For an
-	// allow result, output size equals input size (body unchanged).
-	s := summary{inMessages: len(messages), provider: data.Metadata.Provider, model: model}
+	// messages length, free from the raw bytes we already hold.
+	s := summary{inMessages: len(msgs), provider: data.Metadata.Provider, model: model, slot: -1}
 	if h.verbose {
 		s.inBytes = len(rawMessages)
 		s.outBytes = s.inBytes
@@ -190,28 +211,33 @@ func (h *Handler) process(r *http.Request) (guardrailResponse, summary) {
 	// *before* aperture would have — abandoning exactly the slow, large-context
 	// compressions this tool exists to perform. The latency ceiling belongs to
 	// aperture's per-hook `timeout`, which is owned by the caller.
-	res, err := h.comp.Compress(r.Context(), compressRequest{
-		Messages:    messages,
+	//
+	// Messages pass straight through as raw bytes — no parse into Go values and
+	// no re-marshal; the worker receives the original JSON.
+	res, err := h.comp.Compress(ctx, compressRequest{
+		Messages:    rawMessages,
 		Model:       model,
 		Config:      h.settings.get(),
-		AffinityKey: affinityKey(data.Metadata.SessionID, messages),
+		AffinityKey: affinityKey(data.Metadata.SessionID, msgs),
 	})
 	if err != nil {
 		h.log.Warn("compress failed; allowing", "err", err)
 		s.reason = "allow(error)"
 		return allow, s
 	}
-	// Worker timing/cold/limit and token counts are available for both noop and
-	// modify; record them so the -v line and /metrics reflect them regardless of
-	// the outcome.
+	// Worker timing/cold/limit, slot, and token counts are available for both
+	// noop and modify; record them so the -v line and /metrics reflect them
+	// regardless of the outcome.
 	s.workerMs = res.ElapsedMs
 	s.cold = res.ColdFirstCall
 	s.modelLimit = res.ModelLimit
+	s.slot = res.Slot
 	s.tokensBefore = res.TokensBefore
 	s.tokensSaved = res.TokensSaved
 	s.tokensAfter = res.TokensAfter
-	if res.TokensSaved <= 0 {
-		// No-op: nothing meaningful to change, so don't rewrite the body.
+	if res.TokensSaved <= 0 || len(res.Messages) == 0 {
+		// No-op (or, defensively, an empty result that would null out the body):
+		// don't rewrite the body.
 		s.reason = "allow(noop)"
 		return allow, s
 	}
@@ -219,19 +245,11 @@ func (h *Handler) process(r *http.Request) (guardrailResponse, summary) {
 	// Modify: replace only messages; system, tools, and every other top-level
 	// field pass through unchanged (as their original raw bytes). Headroom
 	// compresses tool_use/tool_result content inside messages, so tool calls are
-	// already covered here. We marshal the compressed messages once — the result
-	// becomes the response body, and its length is out_bytes for free.
-	newMessages, err := json.Marshal(res.Messages)
-	if err != nil {
-		// Couldn't re-encode the compressed messages; fail open rather than
-		// emit a malformed body.
-		h.log.Warn("marshal compressed messages failed; allowing", "err", err)
-		s.reason = "allow(error)"
-		return allow, s
-	}
-	reqBody["messages"] = newMessages
+	// already covered. The worker's compressed messages are already JSON — splice
+	// them in directly (no marshal), and out_bytes is their length for free.
+	reqBody["messages"] = res.Messages
 	if h.verbose {
-		s.outBytes = len(newMessages)
+		s.outBytes = len(res.Messages)
 	}
 	s.reason = "modify"
 	return guardrailResponse{Action: "modify", RequestBody: reqBody}, s
@@ -243,7 +261,7 @@ func (h *Handler) process(r *http.Request) (guardrailResponse, summary) {
 // when absent it falls back to a hash of the opening messages (system + first
 // user message), which is stable across a conversation's turns yet distinct
 // between conversations. Empty only when there are no messages at all.
-func affinityKey(sessionID string, messages []any) string {
+func affinityKey(sessionID string, messages []json.RawMessage) string {
 	if sessionID != "" {
 		return sessionID
 	}
@@ -255,8 +273,17 @@ func affinityKey(sessionID string, messages []any) string {
 		if i >= 2 { // system + first user message is enough to distinguish
 			break
 		}
-		b, _ := json.Marshal(m)
-		_, _ = h.Write(b)
+		// Normalize each of the opening 1-2 messages (parse + re-marshal sorts
+		// object keys) so a client's incidental key reordering between turns
+		// doesn't change the key. Cheap — it's at most two small messages, not
+		// the whole array. Fall back to the raw bytes if a message won't parse.
+		var v any
+		if json.Unmarshal(m, &v) == nil {
+			b, _ := json.Marshal(v)
+			_, _ = h.Write(b)
+		} else {
+			_, _ = h.Write(m)
+		}
 	}
 	return strconv.FormatUint(h.Sum64(), 16)
 }

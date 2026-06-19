@@ -26,7 +26,10 @@ import (
 // Model is optional (the worker lets headroom pick a default when empty);
 // Config carries the runtime-tunable compress knobs.
 type compressRequest struct {
-	Messages []any            `json:"messages"`
+	// Messages is the raw JSON of the request's messages array, passed straight
+	// through to the worker without parsing into Go values and re-marshaling.
+	// json.RawMessage marshals verbatim, so the worker sees the original bytes.
+	Messages json.RawMessage  `json:"messages"`
 	Model    string           `json:"model,omitempty"`
 	Config   CompressSettings `json:"config"`
 
@@ -40,17 +43,23 @@ type compressRequest struct {
 // compressResult mirrors the fields worker.py projects from headroom's
 // CompressResult.
 type compressResult struct {
-	Messages          []any    `json:"messages"`
-	TokensBefore      int      `json:"tokens_before"`
-	TokensAfter       int      `json:"tokens_after"`
-	TokensSaved       int      `json:"tokens_saved"`
-	CompressionRatio  float64  `json:"compression_ratio"`
-	TransformsApplied []string `json:"transforms_applied"`
+	// Messages is the compressed messages array, kept as raw JSON so the handler
+	// can splice it back into the response body without parsing + re-marshaling.
+	Messages          json.RawMessage `json:"messages"`
+	TokensBefore      int             `json:"tokens_before"`
+	TokensAfter       int             `json:"tokens_after"`
+	TokensSaved       int             `json:"tokens_saved"`
+	CompressionRatio  float64         `json:"compression_ratio"`
+	TransformsApplied []string        `json:"transforms_applied"`
 
 	// Diagnostics added by worker.py (not part of headroom's CompressResult).
 	ElapsedMs     float64 `json:"elapsed_ms"`      // worker-side compress() wall time
 	ColdFirstCall bool    `json:"cold_first_call"` // this worker's first real request
 	ModelLimit    int     `json:"model_limit"`     // context-window limit compressed against
+
+	// Slot is the pool slot whose worker served this request. Stamped by the
+	// pool (runSlot), not sent by the worker (json:"-"); -1 when unknown.
+	Slot int `json:"-"`
 }
 
 // requestEnvelope / responseEnvelope are the NDJSON framing on the wire.
@@ -382,6 +391,9 @@ func (p *Pool) runSlot(idx int) {
 			// pinpoints the one-time ML model load.
 			p.log.Info("slow worker call", "slot", idx, "dur", dur,
 				"cold_first_call", res.ColdFirstCall, "worker_ms", res.ElapsedMs)
+		}
+		if res != nil {
+			res.Slot = idx // record which slot served this, for the -v line
 		}
 		j.resp <- jobResult{result: res, err: err}
 	}
