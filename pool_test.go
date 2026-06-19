@@ -41,7 +41,14 @@ func TestHelperProcess(t *testing.T) {
 		os.Exit(0)
 	}
 
-	emit(map[string]any{"ready": true})
+	// Report readiness, optionally with a headroom version (so tests can drive
+	// the version-handshake path). No env -> emit no version (worker that
+	// couldn't read it).
+	ready := map[string]any{"ready": true}
+	if v := os.Getenv("HELPER_HEADROOM_VERSION"); v != "" {
+		ready["headroom_version"] = v
+	}
+	emit(ready)
 
 	r := bufio.NewReader(os.Stdin)
 	calls := 0
@@ -429,5 +436,44 @@ func TestPool_ShutdownAnswersBufferedAffinityJob(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("buffered affinity job hung on shutdown (never answered)")
+	}
+}
+
+func TestSupportsSavingsProfile(t *testing.T) {
+	cases := map[string]bool{
+		"0.25.0": false, "0.25.9": false, // pre-0.26 -> unsupported
+		"0.26.0": true, "0.26.1": true, "0.27.0": true, // >= 0.26 -> supported
+		"1.0.0": true, "1.2.3": true, // any major >= 1
+		"": true, "weird": true, "0.x": true, "0": true, // unparseable -> permissive
+	}
+	for ver, want := range cases {
+		if got := supportsSavingsProfile(ver); got != want {
+			t.Errorf("supportsSavingsProfile(%q) = %v, want %v", ver, got, want)
+		}
+	}
+}
+
+// A worker that reports its headroom version in the ready handshake makes that
+// version available on the pool (for the config-API version gate).
+func TestPool_CapturesHeadroomVersion(t *testing.T) {
+	p := newPool(1, helperCmd("HELPER_HEADROOM_VERSION=0.26.0"), 30*time.Second, quietLog())
+	t.Cleanup(p.Shutdown)
+	if _, err := mustCompress(t, p, compressRequest{Messages: []any{"x"}}, 5*time.Second); err != nil {
+		t.Fatalf("warmup: %v", err)
+	}
+	if ver, ok := p.headroomVersion(); !ok || ver != "0.26.0" {
+		t.Fatalf("headroomVersion() = (%q, %v), want (0.26.0, true)", ver, ok)
+	}
+}
+
+// A worker that doesn't report a version leaves the pool's version unknown
+// (an empty report must not clobber it to "").
+func TestPool_HeadroomVersionUnknownWhenWorkerSilent(t *testing.T) {
+	p := testPool(t, 1) // helperCmd() emits no version
+	if _, err := mustCompress(t, p, compressRequest{Messages: []any{"x"}}, 5*time.Second); err != nil {
+		t.Fatalf("warmup: %v", err)
+	}
+	if ver, ok := p.headroomVersion(); ok {
+		t.Errorf("headroomVersion() = (%q, true), want unknown", ver)
 	}
 }

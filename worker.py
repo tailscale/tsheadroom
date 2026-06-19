@@ -53,6 +53,21 @@ from typing import Any
 _MODERNBERT_REPO = "answerdotai/ModernBERT-base"
 
 
+def _headroom_version() -> str | None:
+    """Installed headroom-ai version string, or None if unreadable.
+
+    Read via importlib.metadata and never by importing headroom — importing it
+    here would pull in transformers before we've set the offline env, which is
+    exactly what this module avoids. Reported to the Go side at startup (see
+    main) so it can gate version-specific config knobs in one place."""
+    try:
+        from importlib.metadata import version
+
+        return version("headroom-ai")
+    except Exception:  # noqa: BLE001 - missing/odd metadata -> unknown
+        return None
+
+
 def _kompress_weights_repo() -> str:
     """HF repo holding the Kompress weights for the *installed* headroom-ai.
 
@@ -60,21 +75,19 @@ def _kompress_weights_repo() -> str:
     (chopratejas/kompress-base -> chopratejas/kompress-v2-base). To support
     hosts on either version (including ones mid-upgrade that still have only the
     old model cached), we resolve the repo from the installed package version
-    rather than hardcoding one. We read the version via importlib.metadata and
-    never by importing headroom — importing it here would pull in transformers
-    before we've set the offline env, which is exactly what this module avoids.
+    rather than hardcoding one.
 
     On an unreadable/odd version we assume the current default (v2): the worst
     case is then a stale guess that loses the offline optimization, never one
     that forces offline against a model the installed version won't load."""
-    try:
-        from importlib.metadata import version
-
-        major, minor = (int(p) for p in version("headroom-ai").split(".")[:2])
-        if (major, minor) < (0, 24):
-            return "chopratejas/kompress-base"
-    except Exception:  # noqa: BLE001 - missing/odd version -> assume current default
-        pass
+    ver = _headroom_version()
+    if ver:
+        try:
+            major, minor = (int(p) for p in ver.split(".")[:2])
+            if (major, minor) < (0, 24):
+                return "chopratejas/kompress-base"
+        except Exception:  # noqa: BLE001 - odd version -> assume current default
+            pass
     return "chopratejas/kompress-v2-base"
 
 
@@ -192,6 +205,26 @@ def _compress(payload: dict[str, Any]) -> dict[str, Any]:
     config = payload.get("config")
     kwargs: dict[str, Any] = dict(config) if isinstance(config, dict) else {}
 
+    # Defense in depth for savings_profile (headroom >= 0.26.0). headroom applies
+    # the named profile *before* compress()'s own fail-open try, so an unknown
+    # name raises ValueError straight out of compress() — which would make the Go
+    # pool recycle this worker on every such request. The Go config layer already
+    # whitelists the value, but if a bad one ever reaches us, drop it and compress
+    # at baseline rather than crash-looping the slot.
+    profile = kwargs.get("savings_profile")
+    if profile:
+        try:
+            from headroom.agent_savings import get_agent_savings_profile
+
+            get_agent_savings_profile(profile)
+        except Exception as e:  # noqa: BLE001 - unknown profile (or pre-0.26 headroom)
+            print(
+                f"tsheadroom: ignoring unusable savings_profile {profile!r} ({e})",
+                file=sys.stderr,
+                flush=True,
+            )
+            kwargs.pop("savings_profile", None)
+
     model = payload.get("model")
     if model:
         kwargs["model"] = model
@@ -265,7 +298,7 @@ def main() -> int:
     os.dup2(2, 1)  # fd 1 -> stderr; print()/library stdout now go to stderr
 
     _warmup()
-    _emit({"ready": True})
+    _emit({"ready": True, "headroom_version": _headroom_version()})
 
     for line in sys.stdin:
         line = line.strip()

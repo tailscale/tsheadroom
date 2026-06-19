@@ -47,7 +47,8 @@ class ProtocolTest(unittest.TestCase):
         ]
         out, proc = run_worker(reqs)
 
-        self.assertEqual(out[0], {"ready": True}, msg=proc.stderr)
+        self.assertTrue(out[0]["ready"], msg=proc.stderr)
+        self.assertIn("headroom_version", out[0])
 
         # 1: valid -> ok with result fields
         self.assertEqual(out[1]["id"], 1)
@@ -79,7 +80,7 @@ class ProtocolTest(unittest.TestCase):
             "config": cfg,
         }})
         out, proc = run_worker([req])
-        self.assertEqual(out[0], {"ready": True}, msg=proc.stderr)
+        self.assertTrue(out[0]["ready"], msg=proc.stderr)
         # The fake headroom echoes the kwargs it received.
         kw = out[1]["result"]["messages"][0]["received_kwargs"]
         self.assertEqual(kw.get("model"), "gpt-4o")
@@ -87,10 +88,26 @@ class ProtocolTest(unittest.TestCase):
         self.assertEqual(kw.get("protect_recent"), 0)
         self.assertEqual(kw.get("target_ratio"), 0.3)
 
+    def test_drops_unusable_savings_profile(self):
+        # The fake headroom has no agent_savings module (mirrors pre-0.26 / an
+        # unvalidatable profile), so the worker's guard must drop savings_profile
+        # rather than forward a value that would raise out of compress().
+        cfg = {"savings_profile": "agent-90", "protect_recent": 1}
+        req = json.dumps({"id": 1, "payload": {
+            "messages": [{"role": "user", "content": "hi"}],
+            "config": cfg,
+        }})
+        out, proc = run_worker([req])
+        self.assertTrue(out[1]["ok"], msg=proc.stderr)
+        kw = out[1]["result"]["messages"][0]["received_kwargs"]
+        self.assertNotIn("savings_profile", kw)
+        # Other knobs still forwarded.
+        self.assertEqual(kw.get("protect_recent"), 1)
+
     def test_clean_exit_on_eof(self):
         out, proc = run_worker([json.dumps({"id": 1, "payload": {"messages": [{"role": "user", "content": "x"}]}})])
         self.assertEqual(proc.returncode, 0, msg=proc.stderr)
-        self.assertEqual(out[0], {"ready": True})
+        self.assertTrue(out[0]["ready"])
 
 
 if __name__ == "__main__":

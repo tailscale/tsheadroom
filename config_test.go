@@ -32,6 +32,10 @@ func TestSettings_Validate(t *testing.T) {
 		{"target_ratio above 1", func(s *CompressSettings) { s.TargetRatio = ptrF(1.5) }, true},
 		{"target_ratio valid", func(s *CompressSettings) { s.TargetRatio = ptrF(0.5) }, false},
 		{"empty kompress_model", func(s *CompressSettings) { e := ""; s.KompressModel = &e }, true},
+		{"savings_profile agent-90", func(s *CompressSettings) { v := "agent-90"; s.SavingsProfile = &v }, false},
+		{"savings_profile balanced", func(s *CompressSettings) { v := "balanced"; s.SavingsProfile = &v }, false},
+		{"savings_profile unknown", func(s *CompressSettings) { v := "fast"; s.SavingsProfile = &v }, true},
+		{"savings_profile empty", func(s *CompressSettings) { v := ""; s.SavingsProfile = &v }, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -205,5 +209,82 @@ func TestConfigHandler_RejectsDelete(t *testing.T) {
 	rec, _ := doConfig(t, h, http.MethodDelete, "")
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("DELETE code=%d, want 405", rec.Code)
+	}
+}
+
+// versionFn returns a headroomVersion accessor for tests: known=true with ver,
+// or known=false when ver is "".
+func versionFn(ver string) func() (string, bool) {
+	return func() (string, bool) {
+		if ver == "" {
+			return "", false
+		}
+		return ver, true
+	}
+}
+
+func TestConfigHandler_SavingsProfileVersionGate(t *testing.T) {
+	tests := []struct {
+		name       string
+		version    string // "" = unknown (no worker reported yet)
+		body       string
+		wantStatus int
+		wantSet    bool // savings_profile non-nil after the call
+	}{
+		{"supported sets profile", "0.26.0", `{"savings_profile":"agent-90"}`, 200, true},
+		{"newer major supported", "1.2.0", `{"savings_profile":"balanced"}`, 200, true},
+		{"old version rejects set", "0.25.0", `{"savings_profile":"agent-90"}`, 400, false},
+		{"old version allows clear", "0.25.0", `{"savings_profile":null}`, 200, false},
+		{"old version ignores untouched", "0.25.0", `{"protect_recent":2}`, 200, false},
+		{"unknown version permissive", "", `{"savings_profile":"agent-90"}`, 200, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			st := loadSettings(filepath.Join(t.TempDir(), "config.json"), quietLog())
+			h := &configHandler{store: st, log: quietLog(), headroomVersion: versionFn(tc.version)}
+			rec, _ := doConfig(t, h, http.MethodPut, tc.body)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d (body: %s)", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			got := st.get().SavingsProfile
+			if tc.wantSet && got == nil {
+				t.Errorf("savings_profile not set, want set")
+			}
+			if !tc.wantSet && got != nil {
+				t.Errorf("savings_profile = %q, want unset", *got)
+			}
+		})
+	}
+}
+
+func TestConfigHandler_GetIncludesHeadroomVersion(t *testing.T) {
+	st := loadSettings("", quietLog())
+	h := &configHandler{store: st, log: quietLog(), headroomVersion: versionFn("0.26.0")}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/config", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET status = %d", rec.Code)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if m["headroom_version"] != "0.26.0" {
+		t.Errorf("headroom_version = %v, want 0.26.0", m["headroom_version"])
+	}
+	if _, ok := m["savings_profile"]; !ok {
+		t.Errorf("savings_profile missing from GET response; want visible")
+	}
+}
+
+func TestConfigHandler_GetOmitsVersionWhenUnknown(t *testing.T) {
+	st := loadSettings("", quietLog())
+	h := &configHandler{store: st, log: quietLog(), headroomVersion: versionFn("")}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/config", nil))
+	var m map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &m)
+	if _, ok := m["headroom_version"]; ok {
+		t.Errorf("headroom_version present when version unknown; want omitted")
 	}
 }

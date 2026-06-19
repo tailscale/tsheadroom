@@ -415,11 +415,15 @@ The default configuration (what `GET /config` returns out of the box):
   "protect_analysis_context": true,
   "target_ratio": null,
   "min_tokens_to_compress": 250,
-  "kompress_model": null
+  "kompress_model": null,
+  "savings_profile": null,
+  "headroom_version": "0.26.0"
 }
 ```
 
-Changes take effect on the next request. Invalid values are rejected with `400` and leave the current configuration untouched (for example, `target_ratio: 5` → `target_ratio must be in (0, 1] or null`). You can also edit the `-config` JSON file directly and restart.
+`headroom_version` is read-only — the headroom-ai version tsheadroom detected on its workers (omitted until the first worker reports ready). It's informational and reflects which knobs the running headroom can actually honor.
+
+Changes take effect on the next request. Invalid values are rejected with `400` and leave the current configuration untouched (for example, `target_ratio: 5` → `target_ratio must be in (0, 1] or null`; `savings_profile: "fast"` → `savings_profile must be one of agent-90, balanced, or null`). You can also edit the `-config` JSON file directly and restart.
 
 Tunable parameters (these mirror Headroom's `CompressConfig`):
 
@@ -432,6 +436,7 @@ Tunable parameters (these mirror Headroom's `CompressConfig`):
 | `target_ratio` | float \| null | `null` | Keep-ratio for text compression: `null` = model decides (~aggressive), `0.5` = keep 50%. Must be in `(0, 1]`. *(Needs `[ml]`.)* |
 | `min_tokens_to_compress` | int | `250` | Skip messages shorter than this. |
 | `kompress_model` | string \| null | `null` | Override the Kompress model id; `null` = default. |
+| `savings_profile` | string \| null | `null` | Apply a named high-savings preset: `agent-90` (aggressive, tuned for coding agents) or `balanced`. **Overrides the individual knobs above** — if you set both, the profile wins. Requires `headroom-ai >= 0.26.0`; on older versions the field is shown but setting it is rejected with `400`. Note: via the library path it applies only the standard knobs (proxy-only profile settings like forced Kompress don't take effect), so realized savings may be below the profile's headline target. |
 
 > **Access**: the `/config` endpoint is gated only by your [tailnet policy file](https://tailscale.com/docs/reference/syntax/policy-file): anyone who can reach the device can read and change its configuration. Lock the device down accordingly (see [Security](#security-and-data-handling)).
 

@@ -84,7 +84,7 @@ func main() {
 	// /config is the runtime tuning API; /metrics is the Prometheus scrape
 	// endpoint; everything else is the aperture hook.
 	mux := http.NewServeMux()
-	mux.Handle("/config", &configHandler{store: settings, log: log})
+	mux.Handle("/config", &configHandler{store: settings, log: log, headroomVersion: pool.headroomVersion})
 	mux.Handle("/metrics", metrics)
 	mux.Handle("/", handler)
 	httpSrv := &http.Server{Handler: mux}

@@ -64,7 +64,8 @@ class RealHeadroomTest(unittest.TestCase):
         )
         out = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
 
-        self.assertEqual(out[0], {"ready": True}, msg=proc.stderr)
+        self.assertTrue(out[0]["ready"], msg=proc.stderr)
+        self.assertTrue(out[0].get("headroom_version"), msg="ready handshake missing headroom_version")
         resp = out[1]
         self.assertTrue(resp["ok"], msg=f"worker error: {resp}\nstderr:\n{proc.stderr}")
         result = resp["result"]
@@ -74,6 +75,44 @@ class RealHeadroomTest(unittest.TestCase):
         self.assertIsInstance(result["messages"], list)
         # A 400-element repetitive tool result should compress.
         self.assertGreater(result["tokens_saved"], 0)
+
+    def _run(self, payload):
+        env = dict(os.environ)
+        env.pop("PYTHONPATH", None)  # no fake headroom shadowing the real one
+        proc = subprocess.run(
+            [sys.executable, "-u", WORKER],
+            input=json.dumps({"id": 1, "payload": payload}) + "\n",
+            capture_output=True, text=True, timeout=180, env=env,
+        )
+        out = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+        return out, proc
+
+    def test_valid_savings_profile_is_honored(self):
+        # headroom 0.26.0+ accepts agent-90; the worker must forward it and
+        # compress() must succeed (no raise, well-formed result).
+        big = json.dumps([{"i": i, "x": "deadbeef" * 8} for i in range(400)])
+        out, proc = self._run({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "user", "content": "go"},
+                {"role": "tool", "content": big},
+                {"role": "user", "content": "summarize"},
+            ],
+            "config": {"savings_profile": "agent-90"},
+        })
+        self.assertTrue(out[0]["ready"], msg=proc.stderr)
+        self.assertTrue(out[1]["ok"], msg=f"worker error: {out[1]}\nstderr:\n{proc.stderr}")
+        self.assertIn("tokens_saved", out[1]["result"])
+
+    def test_invalid_savings_profile_is_dropped_not_fatal(self):
+        # An unknown profile would raise out of compress(); the worker's guard
+        # must drop it and still return a well-formed (ok) result.
+        out, proc = self._run({
+            "messages": [{"role": "user", "content": "hello world"}],
+            "config": {"savings_profile": "does-not-exist"},
+        })
+        self.assertTrue(out[0]["ready"], msg=proc.stderr)
+        self.assertTrue(out[1]["ok"], msg=f"worker error: {out[1]}\nstderr:\n{proc.stderr}")
 
 
 if __name__ == "__main__":
