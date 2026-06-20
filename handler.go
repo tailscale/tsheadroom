@@ -8,6 +8,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -97,14 +98,24 @@ type Handler struct {
 	// response is compressed — the larger request body the hook receives arrives
 	// uncompressed (aperture has no faculty to compress it).
 	gzipResponse bool
+
+	// acceptCompressed, when set, advertises Accept-Encoding (acceptEncoding) on
+	// responses so aperture learns it accepts compressed request bodies and
+	// compresses subsequent ones (RFC 7694). This is the lever that shrinks the
+	// inbound transfer (read_ms) on warm calls. Decoding of an inbound body is
+	// always attempted regardless of this flag — we never choke on a body
+	// aperture sent — so clearing it only stops us advertising the capability.
+	acceptCompressed bool
 }
 
 // summary holds the numbers reported in the -v per-request line and folded into
 // /metrics.
 type summary struct {
-	inMessages int // number of messages received
-	inBytes    int // serialized size of received messages
-	outBytes   int // serialized size of returned messages
+	inMessages int    // number of messages received
+	inBytes    int    // serialized size of received messages
+	outBytes   int    // serialized size of returned messages
+	wireBytes  int    // bytes actually read off the wire (compressed, when the body arrived encoded)
+	enc        string // inbound Content-Encoding we decoded ("" when identity/uncompressed)
 
 	provider string // aperture-resolved provider (metrics label)
 	model    string // aperture-resolved model (metrics label)
@@ -124,6 +135,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.metrics.inboundStart()
 	defer h.metrics.inboundDone()
 
+	// Advertise which request-body codings we accept (RFC 7694). aperture reads
+	// this off the response and compresses subsequent request bodies, shrinking
+	// the inbound transfer that dominates warm-call latency. Set before any
+	// write so it rides every response shape (200, 405, 415).
+	if h.acceptCompressed {
+		w.Header().Set("Accept-Encoding", acceptEncoding)
+	}
+
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -138,11 +157,46 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	var resp guardrailResponse
 	var s summary
-	if readErr != nil {
+	switch {
+	case readErr != nil:
 		h.log.Warn("read request body failed; allowing", "err", readErr)
-		resp, s = guardrailResponse{Action: "allow"}, summary{reason: "allow(read-error)", slot: -1}
-	} else {
-		resp, s = h.process(r.Context(), body)
+		resp, s = guardrailResponse{Action: "allow"}, summary{reason: "allow(read-error)", wireBytes: len(body), slot: -1}
+	default:
+		// Decompress an inbound compressed body (RFC 7694). The Content-Encoding
+		// is purely between aperture and us: on allow, aperture forwards its own
+		// original body upstream, so a decode problem here can never harm the
+		// user's request.
+		wireBytes := len(body)
+		enc := r.Header.Get("Content-Encoding")
+		decoded, coding, decErr := decodeRequestBody(body, enc)
+		switch {
+		case errors.Is(decErr, errUnsupportedEncoding):
+			// We advertised a set aperture no longer matches (e.g. we dropped a
+			// coding between calls). Reject with 415 + Accept-Encoding so it
+			// downgrades to a coding we accept (or identity) and retries. This
+			// is a cooperative downgrade signal, not a block: aperture proceeds
+			// with the user's request uncompressed. Advertise unconditionally
+			// here (even when -accept-compressed is off): a 415 that rejects a
+			// coding is useless to the client without saying what we do accept.
+			h.log.Warn("rejecting unsupported request content-encoding", "encoding", enc)
+			w.Header().Set("Accept-Encoding", acceptEncoding)
+			http.Error(w, "unsupported content-encoding", http.StatusUnsupportedMediaType)
+			s = summary{reason: "reject(encoding)", enc: coding, wireBytes: wireBytes, slot: -1}
+			if h.verbose {
+				fmt.Fprintf(h.out, "%s wire_bytes=%d read_ms=%.0f -> %s\n",
+					reqLabel(coding), wireBytes, readMs, s.reason)
+			}
+			h.metrics.record(s, msSince(start))
+			return
+		case decErr != nil:
+			// Supported coding but the body won't decode (corruption): fail open.
+			h.log.Warn("decode request body failed; allowing", "encoding", enc, "err", decErr)
+			resp, s = guardrailResponse{Action: "allow"}, summary{reason: "allow(decode-error)", enc: coding, wireBytes: wireBytes, slot: -1}
+		default:
+			resp, s = h.process(r.Context(), decoded)
+			s.enc = coding
+			s.wireBytes = wireBytes
+		}
 	}
 
 	// Write the response back to aperture — the other half of the transfer cost.
@@ -156,11 +210,24 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// cost, split so a large gap localizes to the inbound or outbound side
 	// (e.g. write_ms dominating points at back-pressure while aperture drains
 	// our response). dur_ms - read_ms - write_ms - worker_ms is Go/IPC overhead.
+	// The "request(<format>)" prefix tags the inbound compression when aperture
+	// sent a compressed body; wire_bytes << in_bytes with a low read_ms is the
+	// RFC 7694 path working.
 	if h.verbose {
-		fmt.Fprintf(h.out, "request in_msgs=%d in_bytes=%d out_bytes=%d dur_ms=%.0f read_ms=%.0f write_ms=%.0f worker_ms=%.0f slot=%d cold=%t model_limit=%d -> %s\n",
-			s.inMessages, s.inBytes, s.outBytes, durMs, readMs, writeMs, s.workerMs, s.slot, s.cold, s.modelLimit, s.reason)
+		fmt.Fprintf(h.out, "%s in_msgs=%d in_bytes=%d out_bytes=%d wire_bytes=%d dur_ms=%.0f read_ms=%.0f write_ms=%.0f worker_ms=%.0f slot=%d cold=%t model_limit=%d -> %s\n",
+			reqLabel(s.enc), s.inMessages, s.inBytes, s.outBytes, s.wireBytes, durMs, readMs, writeMs, s.workerMs, s.slot, s.cold, s.modelLimit, s.reason)
 	}
 	h.metrics.record(s, durMs)
+}
+
+// reqLabel renders the -v line prefix, tagging the inbound compression format
+// in parens when aperture sent a compressed body (e.g. "request(gzip)") and a
+// plain "request" when the body arrived uncompressed.
+func reqLabel(enc string) string {
+	if enc == "" {
+		return "request"
+	}
+	return "request(" + enc + ")"
 }
 
 // msSince returns milliseconds elapsed since t, with microsecond resolution.

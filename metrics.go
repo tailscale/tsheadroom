@@ -140,6 +140,10 @@ func outcomeFromReason(reason string) string {
 		return "error"
 	case "allow(read-error)":
 		return "read_error"
+	case "allow(decode-error)":
+		return "decode_error"
+	case "reject(encoding)":
+		return "reject_encoding"
 	default: // allow(passthrough) and any future allow(...) shapes
 		return "passthrough"
 	}

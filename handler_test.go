@@ -14,6 +14,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 // fakeCompressor lets each test dictate the pool's behavior.
@@ -27,10 +29,11 @@ func (f fakeCompressor) Compress(ctx context.Context, req compressRequest) (*com
 
 func newTestHandler(fn func(ctx context.Context, req compressRequest) (*compressResult, error)) *Handler {
 	return &Handler{
-		comp:     fakeCompressor{fn: fn},
-		settings: loadSettings("", quietLog()),
-		log:      quietLog(),
-		out:      io.Discard,
+		comp:             fakeCompressor{fn: fn},
+		settings:         loadSettings("", quietLog()),
+		log:              quietLog(),
+		out:              io.Discard,
+		acceptCompressed: true,
 	}
 }
 
@@ -175,6 +178,9 @@ func TestHandler_VerboseSummary(t *testing.T) {
 	doHook(t, h, `{"request_body":{"model":"gpt-4o","messages":[{"role":"user","content":"big"}]}}`)
 
 	line := buf.String()
+	if !strings.HasPrefix(line, "request ") {
+		t.Errorf("uncompressed request should have plain %q prefix, got %q", "request ", line)
+	}
 	for _, want := range []string{"in_msgs=1", "in_bytes=", "out_bytes=", "dur_ms=", "read_ms=", "write_ms=", "worker_ms=", "slot=", "-> modify"} {
 		if !strings.Contains(line, want) {
 			t.Errorf("verbose line %q missing %q", line, want)
@@ -330,4 +336,174 @@ func TestHandler_GzipResponse(t *testing.T) {
 	if got := rec.Header().Get("Content-Encoding"); got != "" {
 		t.Errorf("Content-Encoding = %q, want empty when gzip disabled", got)
 	}
+}
+
+// gzipBytes and zstdBytes encode b with the named coding for request-body tests.
+func gzipBytes(t *testing.T, b []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(b); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func zstdBytes(t *testing.T, b []byte) []byte {
+	t.Helper()
+	enc, err := zstd.NewWriter(nil)
+	if err != nil {
+		t.Fatalf("zstd writer: %v", err)
+	}
+	defer enc.Close()
+	return enc.EncodeAll(b, nil)
+}
+
+// TestHandler_InboundDecode covers the RFC 7694 receive side: a compressed
+// request body is decoded before compression, an unadvertised coding is
+// rejected with 415 + Accept-Encoding, a corrupt body fails open, and every
+// response advertises what we accept.
+func TestHandler_InboundDecode(t *testing.T) {
+	const plain = `{"request_body":{"model":"gpt-4o","messages":[{"role":"user","content":"big"}]}}`
+
+	// post sends body with the given Content-Encoding (empty = none) and
+	// returns the recorder after ServeHTTP.
+	post := func(h *Handler, encoding string, body []byte) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+		if encoding != "" {
+			req.Header.Set("Content-Encoding", encoding)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	modifyH := func() *Handler {
+		return newTestHandler(func(_ context.Context, req compressRequest) (*compressResult, error) {
+			// The worker must receive the decoded plaintext messages.
+			if !json.Valid(req.Messages) {
+				t.Errorf("worker got non-JSON messages: %q", req.Messages)
+			}
+			return &compressResult{Messages: json.RawMessage(`[{"role":"user","content":"small"}]`), TokensSaved: 5}, nil
+		})
+	}
+
+	for _, tc := range []struct {
+		name     string
+		encoding string
+		encode   func(*testing.T, []byte) []byte
+	}{
+		{"gzip", "gzip", gzipBytes},
+		{"zstd", "zstd", zstdBytes},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := modifyH()
+			var buf bytes.Buffer
+			h.verbose, h.out = true, &buf
+			rec := post(h, tc.encoding, tc.encode(t, []byte(plain)))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", rec.Code)
+			}
+			if got := rec.Header().Get("Accept-Encoding"); got != acceptEncoding {
+				t.Errorf("Accept-Encoding = %q, want %q", got, acceptEncoding)
+			}
+			// The -v line tags the inbound format in parens on the prefix.
+			if want := "request(" + tc.encoding + ") "; !strings.HasPrefix(buf.String(), want) {
+				t.Errorf("verbose line %q missing prefix %q", buf.String(), want)
+			}
+			var resp guardrailResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if resp.Action != "modify" {
+				t.Errorf("action = %q, want modify (decoded body must reach compressor)", resp.Action)
+			}
+		})
+	}
+
+	// Identity / no encoding still works and still advertises.
+	t.Run("identity", func(t *testing.T) {
+		rec := post(modifyH(), "", []byte(plain))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+		if got := rec.Header().Get("Accept-Encoding"); got != acceptEncoding {
+			t.Errorf("Accept-Encoding = %q, want %q", got, acceptEncoding)
+		}
+	})
+
+	// Unadvertised coding -> 415 with Accept-Encoding so aperture downgrades.
+	t.Run("unsupported -> 415", func(t *testing.T) {
+		h := newTestHandler(func(context.Context, compressRequest) (*compressResult, error) {
+			t.Error("compressor must not be called on a rejected encoding")
+			return nil, nil
+		})
+		rec := post(h, "br", []byte("whatever"))
+		if rec.Code != http.StatusUnsupportedMediaType {
+			t.Fatalf("status = %d, want 415", rec.Code)
+		}
+		if got := rec.Header().Get("Accept-Encoding"); got != acceptEncoding {
+			t.Errorf("415 Accept-Encoding = %q, want %q", got, acceptEncoding)
+		}
+	})
+
+	// Supported coding but a corrupt body -> fail open (allow, 200), never block.
+	t.Run("corrupt body fails open", func(t *testing.T) {
+		h := newTestHandler(func(context.Context, compressRequest) (*compressResult, error) {
+			t.Error("compressor must not be called when the body can't be decoded")
+			return nil, nil
+		})
+		rec := post(h, "gzip", []byte("not actually gzip"))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (handler must always 2xx)", rec.Code)
+		}
+		var resp guardrailResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if resp.Action != "allow" {
+			t.Errorf("action = %q, want allow on decode failure", resp.Action)
+		}
+	})
+
+	// With advertising disabled, no Accept-Encoding header, but inbound bodies
+	// are still decoded (robustness).
+	t.Run("disabled flag still decodes", func(t *testing.T) {
+		h := modifyH()
+		h.acceptCompressed = false
+		rec := post(h, "zstd", zstdBytes(t, []byte(plain)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+		if got := rec.Header().Get("Accept-Encoding"); got != "" {
+			t.Errorf("Accept-Encoding = %q, want empty when advertising disabled", got)
+		}
+		var resp guardrailResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if resp.Action != "modify" {
+			t.Errorf("action = %q, want modify (decode independent of advertise flag)", resp.Action)
+		}
+	})
+
+	// A 415 rejection must always say what we accept, even with advertising off,
+	// or the client can't recover.
+	t.Run("415 advertises even when flag off", func(t *testing.T) {
+		h := newTestHandler(func(context.Context, compressRequest) (*compressResult, error) {
+			t.Error("compressor must not be called on a rejected encoding")
+			return nil, nil
+		})
+		h.acceptCompressed = false
+		rec := post(h, "br", []byte("whatever"))
+		if rec.Code != http.StatusUnsupportedMediaType {
+			t.Fatalf("status = %d, want 415", rec.Code)
+		}
+		if got := rec.Header().Get("Accept-Encoding"); got != acceptEncoding {
+			t.Errorf("415 Accept-Encoding = %q, want %q even with advertising disabled", got, acceptEncoding)
+		}
+	})
 }
