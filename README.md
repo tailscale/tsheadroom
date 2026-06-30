@@ -424,11 +424,13 @@ The default configuration (what `GET /config` returns out of the box):
   "min_tokens_to_compress": 250,
   "kompress_model": null,
   "savings_profile": null,
-  "headroom_version": "0.26.0"
+  "headroom_version": "0.28.0"
 }
 ```
 
 `headroom_version` is read-only — the headroom-ai version tsheadroom detected on its workers (omitted until the first worker reports ready). It's informational and reflects which knobs the running headroom can actually honor.
+
+The tunable surface below tracks headroom-ai's library `compress()` API, which is intentionally stable: 0.27.0 and 0.28.0 added no new `CompressConfig` knobs, so the fields here are unchanged since 0.26.0 (which introduced `savings_profile`). Newer headroom releases still improve the compression that runs *inside* `compress()` — you get those automatically with no config change. The extra power those releases added (e.g. `force_kompress`, `--protect-tool-results`) lives in headroom's proxy pipeline, which `compress()` does not expose.
 
 Changes take effect on the next request. Invalid values are rejected with `400` and leave the current configuration untouched (for example, `target_ratio: 5` → `target_ratio must be in (0, 1] or null`; `savings_profile: "fast"` → `savings_profile must be one of agent-90, balanced, or null`). You can also edit the `-config` JSON file directly and restart.
 
